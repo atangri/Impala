@@ -46,21 +46,8 @@ DEFINE_string(authorized_proxy_user_config, "",
     "separated list of short usernames, or '*' to indicate all users. For example: "
     "hue=user1,user2;admin=*");
 
-// Describes one method to look up in a Frontend object
-struct Frontend::MethodDescriptor {
-  // Name of the method, case must match
-  const string name;
-
-  // JNI-style method signature
-  const string signature;
-
-  // Handle to the method, set by LoadJNIFrontendMethod
-  jmethodID* method_id;
-};
-
-
 Frontend::Frontend() {
-  MethodDescriptor methods[] = {
+  JniMethodDescriptor methods[] = {
     {"<init>", "(ZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;II)V", &fe_ctor_},
     {"createExecRequest", "([B)[B", &create_exec_request_id_},
     {"getExplainPlan", "([B)Ljava/lang/String;", &get_explain_plan_id_},
@@ -75,15 +62,17 @@ Frontend::Frontend() {
     {"getFunctions", "([B)[B", &get_functions_id_},
     {"getCatalogObject", "([B)[B", &get_catalog_object_id_},
     {"execHiveServer2MetadataOp", "([B)[B", &exec_hs2_metadata_op_id_},
+    {"setCatalogInitialized", "()V", &set_catalog_initialized_id_},
     {"loadTableData", "([B)[B", &load_table_data_id_}};
 
   JNIEnv* jni_env = getJNIEnv();
   // create instance of java class JniFrontend
   fe_class_ = jni_env->FindClass("com/cloudera/impala/service/JniFrontend");
+  EXIT_IF_EXC(jni_env);
 
   uint32_t num_methods = sizeof(methods) / sizeof(methods[0]);
   for (int i = 0; i < num_methods; ++i) {
-    LoadJniFrontendMethod(jni_env, &(methods[i]));
+    EXIT_IF_ERROR(JniUtil::LoadJniMethod(jni_env, fe_class_, &(methods[i])));
   };
 
   jboolean lazy = (FLAGS_load_catalog_at_startup ? false : true);
@@ -99,12 +88,6 @@ Frontend::Frontend() {
       FlagToTLogLevel(FLAGS_non_impala_java_vlog));
   EXIT_IF_EXC(jni_env);
   EXIT_IF_ERROR(JniUtil::LocalToGlobalRef(jni_env, fe, &fe_));
-}
-
-void Frontend::LoadJniFrontendMethod(JNIEnv* jni_env, MethodDescriptor* descriptor) {
-  (*descriptor->method_id) = jni_env->GetMethodID(fe_class_, descriptor->name.c_str(),
-      descriptor->signature.c_str());
-  EXIT_IF_EXC(jni_env);
 }
 
 Status Frontend::UpdateCatalogCache(const TUpdateCatalogCacheRequest& req,
@@ -218,4 +201,13 @@ Status Frontend::LoadData(const TLoadDataReq& request, TLoadDataResp* response) 
 
 bool Frontend::IsAuthorizationError(const Status& status) {
   return !status.ok() && status.GetErrorMsg().find("AuthorizationException") == 0;
+}
+
+Status Frontend::SetCatalogInitialized() {
+  JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
+  jni_env->CallObjectMethod(fe_, set_catalog_initialized_id_);
+  RETURN_ERROR_IF_EXC(jni_env);
+  return Status::OK;
 }

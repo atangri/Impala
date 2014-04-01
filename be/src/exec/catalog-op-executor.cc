@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "exec/catalog-op-executor.h"
+
 #include <sstream>
 
-#include "exec/catalog-op-executor.h"
 #include "common/status.h"
+#include "runtime/lib-cache.h"
 #include "service/impala-server.h"
 #include "util/string-parser.h"
-
+#include <thrift/protocol/TDebugProtocol.h>
 #include "gen-cpp/CatalogService.h"
 #include "gen-cpp/CatalogService_types.h"
+
+#include <thrift/protocol/TDebugProtocol.h>
 
 using namespace std;
 using namespace impala;
@@ -33,22 +37,25 @@ Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
   Status status;
   const TNetworkAddress& address =
       MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
-  CatalogServiceConnection client(client_cache_, address, &status);
+  CatalogServiceConnection client(env_->catalogd_client_cache(), address, &status);
   RETURN_IF_ERROR(status);
   switch (request.op_type) {
     case TCatalogOpType::DDL: {
       // Compute stats stmts must be executed via ExecComputeStats().
       DCHECK(request.ddl_params.ddl_type != TDdlType::COMPUTE_STATS);
-      catalog_update_result_.reset(new TCatalogUpdateResult());
+
       exec_response_.reset(new TDdlExecResponse());
       client->ExecDdl(*exec_response_.get(), request.ddl_params);
       catalog_update_result_.reset(
           new TCatalogUpdateResult(exec_response_.get()->result));
-      return Status(exec_response_->result.status);
+      Status status(exec_response_->result.status);
+      if (status.ok() && request.ddl_params.ddl_type == TDdlType::DROP_FUNCTION) {
+        HandleDropFunction(request.ddl_params.drop_fn_params);
+      }
+      return status;
     }
     case TCatalogOpType::RESET_METADATA: {
       TResetMetadataResponse response;
-      catalog_update_result_.reset(new TCatalogUpdateResult());
       client->ResetMetadata(response, request.reset_metadata_params);
       catalog_update_result_.reset(new TCatalogUpdateResult(response.result));
       return Status(response.result.status);
@@ -88,6 +95,37 @@ Status CatalogOpExecutor::ExecComputeStats(
   // Execute the 'alter table update stats' request.
   RETURN_IF_ERROR(Exec(catalog_op_req));
   return Status::OK;
+}
+
+void CatalogOpExecutor::HandleDropFunction(const TDropFunctionParams& request) {
+  DCHECK(fe_ != NULL) << "FE tests should not be calling this";
+  // Can only be called after successfully processing a catalog update.
+  DCHECK(catalog_update_result_ != NULL);
+
+  // Lookup in the local catalog the metadata for the function.
+  TCatalogObject obj;
+  obj.type = TCatalogObjectType::FUNCTION;
+  obj.fn.name = request.fn_name;
+  obj.fn.arg_types = request.arg_types;
+  obj.fn.signature = request.signature;
+  obj.__isset.fn = true;
+  obj.fn.__isset.signature = true;
+
+  TCatalogObject fn;
+  Status status = fe_->GetCatalogObject(obj, &fn);
+  if (!status.ok()) {
+    // This can happen if the function was dropped by another impalad.
+    VLOG_QUERY << "Could not lookup catalog object: "
+               << apache::thrift::ThriftDebugString(request);
+    return;
+  }
+  // This function may have been dropped and re-created. To avoid removing the re-created
+  // function's entry from the cache verify the existing function has a catalog
+  // version <= the dropped version. This may happen if the update from the statestore
+  // gets applied *before* the result of a direct-DDL drop function command.
+  if (fn.catalog_version <= catalog_update_result_->version) {
+    LibCache::instance()->RemoveEntry(fn.fn.hdfs_location);
+  }
 }
 
 void CatalogOpExecutor::SetTableStats(const TTableSchema& tbl_stats_schema,
@@ -144,4 +182,32 @@ void CatalogOpExecutor::SetColumnStats(const TTableSchema& col_stats_schema,
     params->column_stats[col_stats_schema.columns[i].columnName] = col_stats;
   }
   params->__isset.column_stats = true;
+}
+
+Status CatalogOpExecutor::GetCatalogObject(const TCatalogObject& object_desc,
+    TCatalogObject* result) {
+  const TNetworkAddress& address =
+      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
+  Status status;
+  CatalogServiceConnection client(env_->catalogd_client_cache(), address, &status);
+  RETURN_IF_ERROR(status);
+
+  TGetCatalogObjectRequest request;
+  request.__set_object_desc(object_desc);
+
+  TGetCatalogObjectResponse response;
+  client->GetCatalogObject(response, request);
+  *result = response.catalog_object;
+  return Status::OK;
+}
+
+Status CatalogOpExecutor::PrioritizeLoad(const TPrioritizeLoadRequest& req,
+    TPrioritizeLoadResponse* result) {
+  const TNetworkAddress& address =
+      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
+  Status status;
+  CatalogServiceConnection client(env_->catalogd_client_cache(), address, &status);
+  RETURN_IF_ERROR(status);
+  client->PrioritizeLoad(*result, req);
+  return Status::OK;
 }

@@ -21,6 +21,7 @@ import java.util.Set;
 
 import com.cloudera.impala.authorization.Privilege;
 import com.cloudera.impala.catalog.AuthorizationException;
+import com.cloudera.impala.catalog.HdfsStorageDescriptor;
 import com.cloudera.impala.catalog.HdfsTable;
 import com.cloudera.impala.catalog.RowFormat;
 import com.cloudera.impala.catalog.TableLoadingException;
@@ -167,6 +168,7 @@ public class CreateTableStmt extends StatementBase {
       throw new AnalysisException(Analyzer.TBL_ALREADY_EXISTS_ERROR_MSG +
           String.format("%s.%s", dbName_, getTbl()));
     }
+
     analyzer.addAccessEvent(new TAccessEvent(dbName_ + "." + tableName_.getTbl(),
         TCatalogObjectType.TABLE, Privilege.CREATE.toString()));
 
@@ -217,9 +219,10 @@ public class CreateTableStmt extends StatementBase {
 
   private void analyzeRowFormatValue(String value) throws AnalysisException {
     if (value == null) return;
-    if (value.length() != 1) {
+    if (HdfsStorageDescriptor.parseDelim(value) == null) {
       throw new AnalysisException("ESCAPED BY values and LINE/FIELD " +
-          "terminators must have length of 1: " + value);
+          "terminators must be specified as a single character or as a decimal " +
+          "value in the range [-128:127]: " + value);
     }
   }
 

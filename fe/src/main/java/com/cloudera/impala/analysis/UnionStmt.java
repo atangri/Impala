@@ -23,7 +23,7 @@ import org.slf4j.LoggerFactory;
 
 import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.ColumnStats;
-import com.cloudera.impala.catalog.PrimitiveType;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.InternalException;
 import com.google.common.base.Preconditions;
@@ -133,7 +133,11 @@ public class UnionStmt extends QueryStmt {
   @Override
   public void analyze(Analyzer analyzer)
       throws AnalysisException, AuthorizationException {
-    super.analyze(analyzer);
+    try {
+      super.analyze(analyzer);
+    } catch (AnalysisException e) {
+      if (analyzer.getMissingTbls().isEmpty()) throw e;
+    }
     Preconditions.checkState(operands_.size() > 0);
 
     // Propagates DISTINCT from right to left
@@ -141,25 +145,39 @@ public class UnionStmt extends QueryStmt {
 
     // Make sure all operands return an equal number of exprs.
     QueryStmt firstQuery = operands_.get(0).getQueryStmt();
-    operands_.get(0).analyze(analyzer);
+
+    try {
+      operands_.get(0).analyze(analyzer);
+    } catch (AnalysisException e) {
+      if (analyzer.getMissingTbls().isEmpty()) throw e;
+    }
+
     List<Expr> firstQueryExprs = firstQuery.getBaseTblResultExprs();
     for (int i = 1; i < operands_.size(); ++i) {
       QueryStmt query = operands_.get(i).getQueryStmt();
-      operands_.get(i).analyze(analyzer);
-      List<Expr> exprs = query.getBaseTblResultExprs();
-      if (firstQueryExprs.size() != exprs.size()) {
-        throw new AnalysisException("Operands have unequal number of columns:\n" +
-            "'" + queryStmtToSql(firstQuery) + "' has " +
-            firstQueryExprs.size() + " column(s)\n" +
-            "'" + queryStmtToSql(query) + "' has " + exprs.size() + " column(s)");
+      try {
+        operands_.get(i).analyze(analyzer);
+        List<Expr> exprs = query.getBaseTblResultExprs();
+        if (firstQueryExprs.size() != exprs.size()) {
+          throw new AnalysisException("Operands have unequal number of columns:\n" +
+              "'" + queryStmtToSql(firstQuery) + "' has " +
+              firstQueryExprs.size() + " column(s)\n" +
+              "'" + queryStmtToSql(query) + "' has " + exprs.size() + " column(s)");
+        }
+      } catch (AnalysisException e) {
+        if (analyzer.getMissingTbls().isEmpty()) throw e;
       }
+    }
+
+    if (!analyzer.getMissingTbls().isEmpty()) {
+      throw new AnalysisException("Found missing tables. Aborting analysis.");
     }
 
     // Determine compatible types for exprs, position by position.
     for (int i = 0; i < firstQueryExprs.size(); ++i) {
       // Type compatible with the i-th exprs of all selects.
       // Initialize with type of i-th expr in first select.
-      PrimitiveType compatibleType = firstQueryExprs.get(i).getType();
+      ColumnType compatibleType = firstQueryExprs.get(i).getType();
       // Remember last compatible expr for error reporting.
       Expr lastCompatibleExpr = firstQueryExprs.get(i);
       for (int j = 1; j < operands_.size(); ++j) {
@@ -171,16 +189,11 @@ public class UnionStmt extends QueryStmt {
       // Now that we've found a compatible type, add implicit casts if necessary.
       for (int j = 0; j < operands_.size(); ++j) {
         List<Expr> resultExprs = operands_.get(j).getQueryStmt().getBaseTblResultExprs();
-        if (resultExprs.get(i).getType() != compatibleType) {
+        if (!resultExprs.get(i).getType().equals(compatibleType)) {
           Expr castExpr = resultExprs.get(i).castTo(compatibleType);
           resultExprs.set(i, castExpr);
         }
       }
-    }
-    // TODO: remove
-    for (UnionOperand op: operands_) {
-      LOG.info("resultexprs: " + Expr.toSql(op.getQueryStmt().getBaseTblResultExprs()) + " " +
-          Expr.debugString(op.getQueryStmt().getBaseTblResultExprs()));
     }
 
     // Create tuple descriptor materialized by this UnionStmt,

@@ -106,14 +106,12 @@ public class AggregateInfo {
     aggTupleSMap_ = new Expr.SubstitutionMap();
     groupingExprs_ =
         (groupingExprs != null
-          ? Expr.cloneList(groupingExprs, null)
+          ? Expr.cloneList(groupingExprs)
           : new ArrayList<Expr>());
-    Expr.removeDuplicates(groupingExprs_);
     aggregateExprs_ =
         (aggExprs != null
-          ? Expr.cloneList(aggExprs, null)
+          ? Expr.cloneList(aggExprs)
           : new ArrayList<FunctionCallExpr>());
-    Expr.removeDuplicates(aggregateExprs_);
   }
 
   /**
@@ -132,6 +130,8 @@ public class AggregateInfo {
     Preconditions.checkState(
         (groupingExprs != null && !groupingExprs.isEmpty())
         || (aggExprs != null && !aggExprs.isEmpty()));
+    Expr.removeDuplicates(groupingExprs);
+    Expr.removeDuplicates(aggExprs);
     AggregateInfo result = new AggregateInfo(groupingExprs, aggExprs, false);
 
     // collect agg exprs with DISTINCT clause
@@ -239,6 +239,14 @@ public class AggregateInfo {
     aggTupleDesc_ = aggTupleDesc;
   }
 
+  /**
+   * Return the tuple id produced in the final aggregation step.
+   */
+  public TupleId getOutputTupleId() {
+    if (isDistinctAgg()) return secondPhaseDistinctAggInfo_.getAggTupleId();
+    return getAggTupleId();
+  }
+
   public ArrayList<FunctionCallExpr> getMaterializedAggregateExprs() {
     ArrayList<FunctionCallExpr> result = Lists.newArrayList();
     for (Integer i: materializedAggregateSlots_) {
@@ -285,7 +293,15 @@ public class AggregateInfo {
   public void substitute(Expr.SubstitutionMap smap) {
     Expr.substituteList(groupingExprs_, smap);
     LOG.trace("AggInfo: grouping_exprs=" + Expr.debugString(groupingExprs_));
-    Expr.substituteList(aggregateExprs_, smap);
+
+    // The smap in this case should not substitute the aggs themselves, only
+    // their subexpressions.
+    List<Expr> substitutedAggs = Expr.cloneList(aggregateExprs_, smap);
+    aggregateExprs_.clear();
+    for (Expr substitutedAgg : substitutedAggs) {
+      aggregateExprs_.add((FunctionCallExpr) substitutedAgg);
+    }
+
     LOG.trace("AggInfo: agg_exprs=" + Expr.debugString(aggregateExprs_));
     aggTupleSMap_.substituteLhs(smap);
     if (secondPhaseDistinctAggInfo_ != null) {
@@ -323,9 +339,8 @@ public class AggregateInfo {
           new SlotRef(inputDesc.getSlots().get(i + getGroupingExprs().size()));
       List<Expr> aggExprParamList = Lists.newArrayList(aggExprParam);
       FunctionCallExpr aggExpr = null;
-      if (inputExpr.getAggOp() == BuiltinAggregateFunction.Operator.COUNT) {
-        aggExpr = new FunctionCallExpr(
-            BuiltinAggregateFunction.Operator.SUM, new FunctionParams(aggExprParamList));
+      if (inputExpr.getFnName().getFunction().equals("count")) {
+        aggExpr = new FunctionCallExpr("sum", new FunctionParams(aggExprParamList));
       } else {
         aggExpr = new FunctionCallExpr(inputExpr, new FunctionParams(aggExprParamList));
       }
@@ -402,7 +417,7 @@ public class AggregateInfo {
     for (FunctionCallExpr inputExpr: distinctAggExprs) {
       Preconditions.checkState(inputExpr.isAggregateFunction());
       FunctionCallExpr aggExpr = null;
-      if (inputExpr.getAggOp() == BuiltinAggregateFunction.Operator.COUNT) {
+      if (inputExpr.getFnName().getFunction().equals("count")) {
         // COUNT(DISTINCT ...) ->
         // COUNT(IF(IsNull(<agg slot 1>), NULL, IF(IsNull(<agg slot 2>), NULL, ...)))
         // We need the nested IF to make sure that we do not count
@@ -418,17 +433,16 @@ public class AggregateInfo {
           throw new InternalException("Failed to analyze 'IF' function " +
               "in second phase count distinct aggregation.", e);
         }
-        aggExpr = new FunctionCallExpr(BuiltinAggregateFunction.Operator.COUNT,
+        aggExpr = new FunctionCallExpr("count",
             new FunctionParams(Lists.newArrayList(ifExpr)));
       } else {
         // SUM(DISTINCT <expr>) -> SUM(<last grouping slot>);
         // (MIN(DISTINCT ...) and MAX(DISTINCT ...) have their DISTINCT turned
         // off during analysis, and AVG() is changed to SUM()/COUNT())
-        Preconditions.checkState(inputExpr.getAggOp() ==
-            BuiltinAggregateFunction.Operator.SUM);
+        Preconditions.checkState(inputExpr.getFnName().getFunction().equals("sum"));
         Expr aggExprParam =
             new SlotRef(inputDesc.getSlots().get(origGroupingExprs.size()));
-        aggExpr = new FunctionCallExpr(BuiltinAggregateFunction.Operator.SUM,
+        aggExpr = new FunctionCallExpr("sum",
             new FunctionParams(Lists.newArrayList(aggExprParam)));
       }
       secondPhaseAggExprs.add(aggExpr);
@@ -443,8 +457,8 @@ public class AggregateInfo {
           new SlotRef(inputDesc.getSlots().get(i + getGroupingExprs().size()));
       List<Expr> aggExprParamList = Lists.newArrayList(aggExprParam);
       FunctionCallExpr aggExpr = null;
-      if (inputExpr.getAggOp() == BuiltinAggregateFunction.Operator.COUNT) {
-        aggExpr = new FunctionCallExpr(BuiltinAggregateFunction.Operator.SUM,
+      if (inputExpr.getFnName().getFunction().equals("count")) {
+        aggExpr = new FunctionCallExpr("sum",
             new FunctionParams(aggExprParamList));
       } else {
         // TODO: remap types here. The inserted agg expr doesn't need to be the same
@@ -550,7 +564,7 @@ public class AggregateInfo {
       } else {
         Preconditions.checkArgument(expr instanceof FunctionCallExpr);
         FunctionCallExpr aggExpr = (FunctionCallExpr)expr;
-        if (aggExpr.getAggOp() == BuiltinAggregateFunction.Operator.COUNT) {
+        if (aggExpr.getFnName().getFunction().equals("count")) {
           outputSlotDesc.setIsNullable(false);
         }
       }
@@ -595,6 +609,19 @@ public class AggregateInfo {
     if (isDistinctAgg_) {
       secondPhaseDistinctAggInfo_.materializeRequiredSlots(analyzer, null);
     }
+  }
+
+  /**
+   * Sanity check that the number of materialized slots of the agg tuple corresponds to
+   * the number of materialized aggregate functions plus the number of grouping exprs.
+   */
+  public void checkConsistency() {
+    int numMaterializedSlots = 0;
+    for (SlotDescriptor slotDesc: aggTupleDesc_.getSlots()) {
+      if (slotDesc.isMaterialized()) ++numMaterializedSlots;
+    }
+    Preconditions.checkState(numMaterializedSlots ==
+        materializedAggregateSlots_.size() + groupingExprs_.size());
   }
 
   /**

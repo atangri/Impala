@@ -37,6 +37,7 @@
 namespace impala {
 
 class MemTracker;
+class QueryResourceMgr;
 
 // A MemTracker tracks memory consumption; it contains an optional limit
 // and can be arranged into a tree structure such that the consumption tracked
@@ -87,8 +88,18 @@ class MemTracker {
   // 'parent' as the parent tracker.
   // byte_limit and parent must be the same for all GetMemTracker() calls with the
   // same id.
-  static boost::shared_ptr<MemTracker> GetQueryMemTracker(
-      const TUniqueId& id, int64_t byte_limit, MemTracker* parent);
+  static boost::shared_ptr<MemTracker> GetQueryMemTracker(const TUniqueId& id,
+      int64_t byte_limit, MemTracker* parent, QueryResourceMgr* res_mgr);
+
+  // Returns a MemTracker object for request pool 'pool_name'. Calling this with the same
+  // 'pool_name' will return the same MemTracker object. This is used to track the local
+  // memory usage of all requests executing in this pool. The first time this is called
+  // for a pool, a new MemTracker object is created with the parent tracker if it is not
+  // NULL. If the parent is NULL, no new tracker will be created and NULL is returned.
+  // There is no explicit per-pool byte_limit set at any particular impalad, so newly
+  // created trackers will always have a limit of -1.
+  static MemTracker* GetRequestPoolMemTracker(const std::string& pool_name,
+      MemTracker* parent);
 
   // Increases consumption of this tracker and its ancestors by 'bytes'.
   void Consume(int64_t bytes) {
@@ -102,9 +113,16 @@ class MemTracker {
     for (std::vector<MemTracker*>::iterator tracker = all_trackers_.begin();
          tracker != all_trackers_.end(); ++tracker) {
       (*tracker)->consumption_->Update(bytes);
-      DCHECK_GE((*tracker)->consumption_->current_value(), 0);
+      if ((*tracker)->consumption_metric_ == NULL) {
+        DCHECK_GE((*tracker)->consumption_->current_value(), 0);
+      }
     }
   }
+
+  // Try to expand the limit (by asking the resource broker for more memory) by at least
+  // 'bytes'. Returns false if not possible, true if the request succeeded. May allocate
+  // more memory than was requested.
+  bool ExpandLimit(int64_t bytes);
 
   // Increases consumption of this tracker and its ancestors by 'bytes' only if
   // they can all consume 'bytes'. If this brings any of them over, none of them
@@ -112,33 +130,41 @@ class MemTracker {
   // Returns true if the try succeeded.
   bool TryConsume(int64_t bytes) {
     if (consumption_metric_ != NULL) consumption_->Set(consumption_metric_->value());
-    if (bytes == 0) return true;
+    if (bytes <= 0) return true;
     if (UNLIKELY(enable_logging_)) LogUpdate(true, bytes);
     int i = 0;
-    for (; i < all_trackers_.size(); ++i) {
+    // Walk the tracker tree top-down, to avoid expanding a limit on a child whose parent
+    // won't accommodate the change.
+    for (i = all_trackers_.size() - 1; i >= 0; --i) {
       if (all_trackers_[i]->limit_ < 0) {
         all_trackers_[i]->consumption_->Update(bytes);
       } else {
         if (!all_trackers_[i]->consumption_->TryUpdate(bytes, all_trackers_[i]->limit_)) {
-          // One of the trackers failed, attempt to GC memory. If that succeeds,
-          // TryUpdate() again. Bail if either fails.
-          if (all_trackers_[i]->GcMemory(all_trackers_[i]->limit_ - bytes) ||
-              !all_trackers_[i]->consumption_->TryUpdate(
-                  bytes, all_trackers_[i]->limit_)) {
+          // One of the trackers failed, attempt to GC memory or expand our limit. If that
+          // succeeds, TryUpdate() again. Bail if either fails.
+          if (!all_trackers_[i]->GcMemory(all_trackers_[i]->limit_ - bytes) ||
+              all_trackers_[i]->ExpandLimit(bytes)) {
+            if (!all_trackers_[i]->consumption_->TryUpdate(
+                bytes, all_trackers_[i]->limit_)) break;
+          } else {
             break;
           }
         }
       }
     }
     // Everyone succeeded, return.
-    if (i == all_trackers_.size()) return true;
+    if (i == -1) return true;
 
     // Someone failed, roll back the ones that succeeded.
     // TODO: this doesn't roll it back completely since the max values for
     // the updated trackers aren't decremented. The max values are only used
     // for error reporting so this is probably okay. Rolling those back is
     // pretty hard; we'd need something like 2PC.
-    for (int j = 0; j < i; ++j) {
+    //
+    // TODO: This might leave us with an allocated resource that we can't use. Do we need
+    // to adjust the consumption of the query tracker to stop the resource from never
+    // getting used by a subsequent TryConsume()?
+    for (int j = all_trackers_.size() - 1; j > i; --j) {
       all_trackers_[j]->consumption_->Update(-bytes);
     }
     return false;
@@ -156,8 +182,18 @@ class MemTracker {
     for (std::vector<MemTracker*>::iterator tracker = all_trackers_.begin();
          tracker != all_trackers_.end(); ++tracker) {
       (*tracker)->consumption_->Update(-bytes);
-      DCHECK_GE((*tracker)->consumption_->current_value(), 0);
+      // If a UDF calls FunctionContext::TrackAllocation() but allocates less than the
+      // reported amount, the subsequent call to FunctionContext::Free() may cause the
+      // process mem tracker to go negative until it is synced back to the tcmalloc
+      // metric. Don't blow up in this case. (Note that this doesn't affect non-process
+      // trackers since we can enforce that the reported memory usage is internally
+      // consistent.)
+      if ((*tracker)->consumption_metric_ == NULL) {
+        DCHECK_GE((*tracker)->consumption_->current_value(), 0);
+      }
     }
+
+    // TODO: Release brokered memory?
   }
 
   // Returns true if a valid limit of this tracker or one of its ancestors is
@@ -227,20 +263,35 @@ class MemTracker {
   // gc_lock. Updates metrics if initialized.
   bool GcMemory(int64_t max_consumption);
 
+  // Set the resource mgr to allow expansion of limits (if NULL, no expansion is possible)
+  void SetQueryResourceMgr(QueryResourceMgr* context) {
+    query_resource_mgr_ = context;
+  }
+
   // Lock to protect GcMemory(). This prevents many GCs from occurring at once.
   SpinLock gc_lock_;
 
-  // All MemTracker objects that are in use and lock protecting it.
-  // For memory management, this map contains only weak ptrs.  MemTrackers that are
-  // handed out via GetQueryMemTracker() are shared ptrs.  When all the shared ptrs are
-  // no longer referenced, the MemTracker d'tor will be called at which point the
-  // weak ptr will be removed from the map.
-  typedef boost::unordered_map<TUniqueId, boost::weak_ptr<MemTracker> > MemTrackersMap;
-  static MemTrackersMap uid_to_mem_trackers_;
-  static boost::mutex uid_to_mem_trackers_lock_;
+  // Protects request_to_mem_trackers_ and pool_to_mem_trackers_
+  static boost::mutex static_mem_trackers_lock_;
 
-  // Only valid for MemTrackers returned from GetMemTracker()
+  // All per-request MemTracker objects that are in use.  For memory management, this map
+  // contains only weak ptrs.  MemTrackers that are handed out via GetQueryMemTracker()
+  // are shared ptrs.  When all the shared ptrs are no longer referenced, the MemTracker
+  // d'tor will be called at which point the weak ptr will be removed from the map.
+  typedef boost::unordered_map<TUniqueId, boost::weak_ptr<MemTracker> >
+  RequestTrackersMap;
+  static RequestTrackersMap request_to_mem_trackers_;
+
+  // All per-request pool MemTracker objects. It is assumed that request pools will live
+  // for the entire duration of the process lifetime.
+  typedef boost::unordered_map<std::string, MemTracker*> PoolTrackersMap;
+  static PoolTrackersMap pool_to_mem_trackers_;
+
+  // Only valid for MemTrackers returned from GetQueryMemTracker()
   TUniqueId query_id_;
+
+  // Only valid for MemTrackers returned from GetRequestPoolMemTracker()
+  std::string pool_name_;
 
   int64_t limit_;  // in bytes; < 0: no limit
   std::string label_;
@@ -284,6 +335,13 @@ class MemTracker {
   // If true, log the stack as well.
   bool log_stack_;
 
+  // Lock is taken during ExpandLimit() to prevent concurrent acquisition of new resources.
+  boost::mutex resource_acquisition_lock_;
+
+  // If non-NULL, contains all the information required to expand resource reservations if
+  // required.
+  QueryResourceMgr* query_resource_mgr_;
+
   // Walks the MemTracker hierarchy and populates all_trackers_ and
   // limit_trackers_
   void Init();
@@ -313,4 +371,3 @@ class MemTracker {
 }
 
 #endif
-

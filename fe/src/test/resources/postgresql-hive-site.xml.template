@@ -85,6 +85,12 @@
   <description></description>
 </property>
 
+<property>
+  <!--  Location of Hive per-query log files of the form: hive_job_log_<hive_query_id>.txt -->
+  <name>hive.querylog.location</name>
+  <value>${IMPALA_TEST_CLUSTER_LOG_DIR}/hive</value>
+</property>
+
 <!--property>
   <name>test.log.dir</name>
   <value>${build.dir}/test/logs</value>
@@ -115,5 +121,12 @@
 <property>
   <name>hive.server2.authentication</name>
   <value>NOSASL</value>
+</property>
+
+<property>
+  <!--  TODO: Remove this once Hive has changed their default back to ColumnarSerDe -->
+  <name>hive.default.rcfile.serde</name>
+  <value>org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe</value>
+  <description>The default SerDe hive will use for the rcfile format</description>
 </property>
 </configuration>

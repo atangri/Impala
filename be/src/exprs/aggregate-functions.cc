@@ -46,6 +46,15 @@ void AggregateFunctions::InitZero(FunctionContext*, T* dst) {
   dst->val = 0;
 }
 
+StringVal AggregateFunctions::StringValSerializeOrFinalize(
+    FunctionContext* ctx, const StringVal& src) {
+  if (src.is_null) return src;
+  StringVal result(ctx, src.len);
+  memcpy(result.ptr, src.ptr, src.len);
+  ctx->Free(src.ptr);
+  return result;
+}
+
 void AggregateFunctions::CountUpdate(
     FunctionContext*, const AnyVal& src, BigIntVal* dst) {
   DCHECK(!dst->is_null);
@@ -130,6 +139,11 @@ void AggregateFunctions::Max(FunctionContext*,
   TimestampValue src_tv = TimestampValue::FromTimestampVal(src);
   TimestampValue dst_tv = TimestampValue::FromTimestampVal(*dst);
   if (src_tv > dst_tv) *dst = src;
+}
+
+void AggregateFunctions::StringConcat(FunctionContext* ctx, const StringVal& src,
+      StringVal* result) {
+  StringConcat(ctx, src, DEFAULT_STRING_CONCAT_DELIM, result);
 }
 
 void AggregateFunctions::StringConcat(FunctionContext* ctx, const StringVal& src,
@@ -325,9 +339,9 @@ StringVal AggregateFunctions::PcFinalize(FunctionContext* c, const StringVal& sr
   stringstream ss;
   ss << result;
   string str = ss.str();
-  StringVal dst = src;
+  StringVal dst(c, str.length());
   memcpy(dst.ptr, str.c_str(), str.length());
-  dst.len = str.length();
+  c->Free(src.ptr);
   return dst;
 }
 
@@ -342,6 +356,7 @@ StringVal AggregateFunctions::PcsaFinalize(FunctionContext* c, const StringVal& 
   StringVal dst = src;
   memcpy(dst.ptr, str.c_str(), str.length());
   dst.len = str.length();
+  c->Free(src.ptr);
   return dst;
 }
 
@@ -417,14 +432,13 @@ StringVal AggregateFunctions::HllFinalize(FunctionContext* ctx, const StringVal&
   string out_str = out.str();
   StringVal result_str(ctx, out_str.size());
   memcpy(result_str.ptr, out_str.c_str(), result_str.len);
+  ctx->Free(src.ptr);
   return result_str;
 }
 
 // Stamp out the templates for the types we need.
 template void AggregateFunctions::InitZero<BigIntVal>(FunctionContext*, BigIntVal* dst);
 
-template void AggregateFunctions::Sum<BooleanVal, BigIntVal>(
-    FunctionContext*, const BooleanVal& src, BigIntVal* dst);
 template void AggregateFunctions::Sum<TinyIntVal, BigIntVal>(
     FunctionContext*, const TinyIntVal& src, BigIntVal* dst);
 template void AggregateFunctions::Sum<SmallIntVal, BigIntVal>(

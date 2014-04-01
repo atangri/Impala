@@ -27,8 +27,10 @@
 // stringstream is a typedef, so can't forward declare it.
 #include <sstream>
 
+#include "statestore/query-resource-mgr.h"
 #include "runtime/exec-env.h"
 #include "runtime/descriptors.h"  // for PlanNodeId
+#include "runtime/disk-io-mgr.h"  // for DiskIoMgr::ReaderContext
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/thread-resource-mgr.h"
@@ -40,7 +42,6 @@
 namespace impala {
 
 class DescriptorTbl;
-class DiskIoMgr;
 class ObjectPool;
 class Status;
 class ExecEnv;
@@ -68,7 +69,7 @@ typedef std::map<std::string, std::string> FileMoveMap;
 class RuntimeState {
  public:
   RuntimeState(const TUniqueId& query_id, const TUniqueId& fragment_instance_id,
-      const TQueryContext& query_ctxt, ExecEnv* exec_env);
+      const TQueryContext& query_ctxt, const std::string& cgroup, ExecEnv* exec_env);
 
   // RuntimeState for executing expr in fe-support.
   RuntimeState(const TQueryContext& query_ctxt);
@@ -76,12 +77,14 @@ class RuntimeState {
   // Empty d'tor to avoid issues with scoped_ptr.
   ~RuntimeState();
 
-  // Set up four-level hierarchy of mem trackers: process, query, fragment instance.
-  // The instance tracker is tied to our profile.
-  // Specific parts of the fragment (i.e. exec nodes, sinks, data stream senders, etc)
-  // will add a fourth level when they are initialized.
-  // This function also initializes a user function mem tracker (in the fourth level).
-  Status InitMemTrackers(const TUniqueId& query_id);
+  // Set up five-level hierarchy of mem trackers: process, pool, query, fragment
+  // instance. The instance tracker is tied to our profile. Specific parts of the
+  // fragment (i.e. exec nodes, sinks, data stream senders, etc) will add a fifth level
+  // when they are initialized. This function also initializes a user function mem
+  // tracker (in the fifth level). If 'request_pool' is null, no request pool mem
+  // tracker is set up, i.e. query pools will have the process mem pool as the parent.
+  Status InitMemTrackers(const TUniqueId& query_id, const std::string* request_pool,
+      int64_t query_bytes_limit);
 
   ObjectPool* obj_pool() const { return obj_pool_.get(); }
   const DescriptorTbl& desc_tbl() const { return *desc_tbl_; }
@@ -98,7 +101,7 @@ class RuntimeState {
   }
   int max_errors() const { return query_ctxt_.request.query_options.max_errors; }
   const TQueryContext& query_ctxt() const { return query_ctxt_; }
-  const std::string& user() const { return query_ctxt_.session.user; }
+  const std::string& connected_user() const { return query_ctxt_.session.connected_user; }
   const TimestampValue* now() const { return now_.get(); }
   void set_now(const TimestampValue* now);
   const std::vector<std::string>& error_log() const { return error_log_; }
@@ -107,10 +110,9 @@ class RuntimeState {
   }
   const TUniqueId& query_id() const { return query_id_; }
   const TUniqueId& fragment_instance_id() const { return fragment_instance_id_; }
+  const std::string& cgroup() const { return cgroup_; }
   ExecEnv* exec_env() { return exec_env_; }
   DataStreamMgr* stream_mgr() { return exec_env_->stream_mgr(); }
-  HdfsFsCache* fs_cache() { return exec_env_->fs_cache(); }
-  LibCache* lib_cache() { return exec_env_->lib_cache(); }
   HBaseTableFactory* htable_factory() { return exec_env_->htable_factory(); }
   ImpalaInternalServiceClientCache* impalad_client_cache() {
     return exec_env_->impalad_client_cache();
@@ -120,11 +122,13 @@ class RuntimeState {
   }
   DiskIoMgr* io_mgr() { return exec_env_->disk_io_mgr(); }
   MemTracker* instance_mem_tracker() { return instance_mem_tracker_.get(); }
+  MemTracker* query_mem_tracker() { return query_mem_tracker_.get(); }
   ThreadResourceMgr::ResourcePool* resource_pool() { return resource_pool_; }
 
   FileMoveMap* hdfs_files_to_move() { return &hdfs_files_to_move_; }
   PartitionRowCount* num_appended_rows() { return &num_appended_rows_; }
   PartitionInsertStats* insert_stats() { return &insert_stats_; }
+  std::vector<DiskIoMgr::ReaderContext*>* reader_contexts() { return &reader_contexts_; }
 
   // Returns runtime state profile
   RuntimeProfile* runtime_profile() { return &profile_; }
@@ -198,8 +202,11 @@ class RuntimeState {
   RuntimeProfile::Counter* total_storage_wait_timer() {
     return total_storage_wait_timer_;
   }
-  RuntimeProfile::Counter* total_network_wait_timer() {
-    return total_network_wait_timer_;
+  RuntimeProfile::Counter* total_network_send_timer() {
+    return total_network_send_timer_;
+  }
+  RuntimeProfile::Counter* total_network_receive_timer() {
+    return total_network_receive_timer_;
   }
 
   // Sets query_status_ with err_msg if no error has been set yet.
@@ -221,6 +228,9 @@ class RuntimeState {
   // or a mem limit was exceeded). Exec nodes should check this periodically so execution
   // doesn't continue if the query terminates abnormally.
   Status CheckQueryState();
+
+  QueryResourceMgr* query_resource_mgr() const { return query_resource_mgr_; }
+  void SetQueryResourceMgr(QueryResourceMgr* res_mgr) { query_resource_mgr_ = res_mgr; }
 
  private:
   // Set per-fragment state.
@@ -263,6 +273,10 @@ class RuntimeState {
 
   TUniqueId query_id_;
   TUniqueId fragment_instance_id_;
+
+  // The Impala-internal cgroup into which execution threads are assigned.
+  // If empty, no RM is enabled.
+  std::string cgroup_;
   ExecEnv* exec_env_;
   boost::scoped_ptr<LlvmCodeGen> codegen_;
 
@@ -288,8 +302,11 @@ class RuntimeState {
   // Total time waiting in storage (across all threads)
   RuntimeProfile::Counter* total_storage_wait_timer_;
 
-  // Total time waiting in network (across all threads)
-  RuntimeProfile::Counter* total_network_wait_timer_;
+  // Total time spent sending over the network (across all threads)
+  RuntimeProfile::Counter* total_network_send_timer_;
+
+  // Total time spent receiving over the network (across all threads)
+  RuntimeProfile::Counter* total_network_receive_timer_;
 
   // MemTracker that is shared by all fragment instances running on this host.
   // The query mem tracker must be released after the instance_mem_tracker_.
@@ -311,6 +328,13 @@ class RuntimeState {
   // TODO: this is a stopgap until we implement ExprContext
   boost::scoped_ptr<MemTracker> udf_mem_tracker_;
   boost::scoped_ptr<MemPool> udf_pool_;
+
+  // Query-wide resource manager for resource expansion etc. Not owned by us; owned by the
+  // ResourceBroker instead.
+  QueryResourceMgr* query_resource_mgr_;
+
+  // Reader contexts that need to be closed when the fragment is closed.
+  std::vector<DiskIoMgr::ReaderContext*> reader_contexts_;
 
   // prohibit copies
   RuntimeState(const RuntimeState&);

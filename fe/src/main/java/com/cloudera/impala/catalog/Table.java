@@ -14,6 +14,7 @@
 
 package com.cloudera.impala.catalog;
 
+import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
@@ -23,13 +24,15 @@ import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.ColumnStatistics;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
-import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.ql.stats.StatsSetupConst;
-import org.apache.hadoop.hive.serde.serdeConstants;
 import org.apache.log4j.Logger;
 
-import com.cloudera.impala.common.JniUtil;
+import com.cloudera.impala.analysis.CreateTableStmt;
+import com.cloudera.impala.analysis.SqlParser;
+import com.cloudera.impala.analysis.SqlScanner;
+import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.thrift.TAccessLevel;
+import com.cloudera.impala.thrift.TCatalogObject;
 import com.cloudera.impala.thrift.TCatalogObjectType;
 import com.cloudera.impala.thrift.TColumn;
 import com.cloudera.impala.thrift.TTable;
@@ -89,11 +92,12 @@ public abstract class Table implements CatalogObject {
     id_ = id;
     msTable_ = msTable;
     db_ = db;
-    name_ = name;
+    name_ = name.toLowerCase();
     owner_ = owner;
     colsByPos_ = Lists.newArrayList();
     colsByName_ = Maps.newHashMap();
-    lastDdlTime_ = (msTable_ != null) ? Catalog.getLastDdlTime(msTable_) : -1;
+    lastDdlTime_ = (msTable_ != null) ?
+        CatalogServiceCatalog.getLastDdlTime(msTable_) : -1;
   }
 
   //number of nodes that contain data for this table; -1: unknown
@@ -116,55 +120,6 @@ public abstract class Table implements CatalogObject {
   public void updateLastDdlTime(long ddlTime) {
     // Ensure the lastDdlTime never goes backwards.
     if (ddlTime > lastDdlTime_) lastDdlTime_ = ddlTime;
-  }
-
-  /**
-   * Creates the Impala representation of Hive/HBase metadata for one table.
-   * Calls load() on the appropriate instance of Table subclass.
-   * oldCacheEntry is the existing cache entry and might still contain valid info to help
-   * speed up metadata loading. oldCacheEntry is null if there is no existing cache entry
-   * (i.e. during fresh load).
-   * @return new instance of HdfsTable or HBaseTable
-   *         null if the table does not exist
-   * @throws TableLoadingException if there was an error loading the table.
-   * @throws TableNotFoundException if the table was not found
-   */
-  public static Table load(TableId id, HiveMetaStoreClient client, Db db,
-      String tblName, Table oldCacheEntry) throws TableLoadingException,
-      TableNotFoundException {
-
-    // turn all exceptions into TableLoadingException
-    try {
-      org.apache.hadoop.hive.metastore.api.Table msTbl = null;
-      // All calls to getTable() need to be serialized due to HIVE-5457.
-      synchronized (metastoreAccessLock_) {
-        msTbl = client.getTable(db.getName(), tblName);
-      }
-      // Check that the Hive TableType is supported
-      TableType tableType = TableType.valueOf(msTbl.getTableType());
-      if (!SUPPORTED_TABLE_TYPES.contains(tableType)) {
-        throw new TableLoadingException(String.format(
-            "Unsupported table type '%s' for: %s.%s", tableType, db.getName(), tblName));
-      }
-
-      // Create a table of appropriate type and have it load itself
-      Table table = fromMetastoreTable(id, db, msTbl);
-      if (table == null) {
-        throw new TableLoadingException(
-            "Unrecognized table type for table: " + msTbl.getTableName());
-      }
-      table.load(oldCacheEntry, client, msTbl);
-      return table;
-    } catch (TableLoadingException e) {
-      return new IncompleteTable(id, db, tblName, e);
-    } catch (NoSuchObjectException e) {
-      throw new TableNotFoundException("Table not found: " + tblName, e);
-    } catch (Exception e) {
-      LOG.error(JniUtil.throwableToString(e) + "\n" +
-                JniUtil.throwableToStackTrace(e));
-      throw new TableLoadingException(
-          "Failed to load metadata for table: " + tblName, e);
-    }
   }
 
   /**
@@ -233,21 +188,24 @@ public abstract class Table implements CatalogObject {
   }
 
   /**
-   * Gets the PrimitiveType from the given FieldSchema. Throws a TableLoadingException
-   * if the FieldSchema does not represent a supported primitive type.
+   * Factory method that creates a new Table from its Thrift representation.
+   * Determines the type of table to create based on the Thrift table provided.
    */
-  protected PrimitiveType getPrimitiveType(FieldSchema fs)
+  public static Table fromThrift(Db parentDb, TTable thriftTable)
       throws TableLoadingException {
-    // catch currently unsupported hive schema elements
-    if (!serdeConstants.PrimitiveTypes.contains(fs.getType())) {
-      throw new TableLoadingException(String.format(
-          "Failed to load metadata for table '%s' due to unsupported " +
-          "column type '%s' in column '%s'", getName(), fs.getType(), fs.getName()));
+    Table newTable;
+    if (!thriftTable.isSetLoad_status() && thriftTable.isSetMetastore_table())  {
+      newTable = Table.fromMetastoreTable(new TableId(thriftTable.getId()),
+          parentDb, thriftTable.getMetastore_table());
+    } else {
+      newTable = IncompleteTable.createUninitializedTable(
+          TableId.createInvalidId(), parentDb, thriftTable.getTbl_name());
     }
-    return getPrimitiveType(fs.getType());
+    newTable.loadFromThrift(thriftTable);
+    return newTable;
   }
 
-  public void loadFromThrift(TTable thriftTable) throws TableLoadingException {
+  protected void loadFromThrift(TTable thriftTable) throws TableLoadingException {
     List<TColumn> columns = new ArrayList<TColumn>();
     columns.addAll(thriftTable.getClustering_columns());
     columns.addAll(thriftTable.getColumns());
@@ -300,37 +258,56 @@ public abstract class Table implements CatalogObject {
     return table;
   }
 
-  protected static PrimitiveType getPrimitiveType(String typeName) {
-    if (typeName.toLowerCase().equals("tinyint")) {
-      return PrimitiveType.TINYINT;
-    } else if (typeName.toLowerCase().equals("smallint")) {
-      return PrimitiveType.SMALLINT;
-    } else if (typeName.toLowerCase().equals("int")) {
-      return PrimitiveType.INT;
-    } else if (typeName.toLowerCase().equals("bigint")) {
-      return PrimitiveType.BIGINT;
-    } else if (typeName.toLowerCase().equals("boolean")) {
-      return PrimitiveType.BOOLEAN;
-    } else if (typeName.toLowerCase().equals("float")) {
-      return PrimitiveType.FLOAT;
-    } else if (typeName.toLowerCase().equals("double")) {
-      return PrimitiveType.DOUBLE;
-    } else if (typeName.toLowerCase().equals("date")) {
-      return PrimitiveType.DATE;
-    } else if (typeName.toLowerCase().equals("datetime")) {
-      return PrimitiveType.DATETIME;
-    } else if (typeName.toLowerCase().equals("timestamp")) {
-      return PrimitiveType.TIMESTAMP;
-    } else if (typeName.toLowerCase().equals("string")) {
-      return PrimitiveType.STRING;
-    } else if (typeName.toLowerCase().equals("binary")) {
-      return PrimitiveType.BINARY;
-    } else if (typeName.toLowerCase().equals("decimal")) {
-      return PrimitiveType.DECIMAL;
-    } else {
-      return PrimitiveType.INVALID_TYPE;
-    }
+  public TCatalogObject toTCatalogObject() {
+    TCatalogObject catalogObject = new TCatalogObject();
+    catalogObject.setType(getCatalogObjectType());
+    catalogObject.setCatalog_version(getCatalogVersion());
+    catalogObject.setTable(toThrift());
+    return catalogObject;
   }
+
+  /*
+   * Gets the ColumnType from the given FieldSchema by using Impala's SqlParser.
+   * Throws a TableLoadingException if the FieldSchema could not be parsed.
+   * The type can either be:
+   *   - Supported by Impala, in which case the type is returned.
+   *   - A type Impala understands but is not yet implemented (e.g. date), the type is
+   *     returned but type.IsSupported() returns false.
+   *   - A type Impala can't understand at all, and a TableLoadingException is thrown.
+   */
+   protected ColumnType parseColumnType(FieldSchema fs) throws TableLoadingException {
+     // Wrap the type string in a CREATE TABLE stmt and use Impala's Parser
+     // to get the ColumnType.
+     // Pick a table name that can't be used.
+     String stmt = String.format("CREATE TABLE $DUMMY ($DUMMY %s)", fs.getType());
+     SqlScanner input = new SqlScanner(new StringReader(stmt));
+     SqlParser parser = new SqlParser(input);
+     CreateTableStmt createTableStmt;
+     try {
+       Object o = parser.parse().value;
+       if (!(o instanceof CreateTableStmt)) {
+         // Should never get here.
+         throw new InternalException("Couldn't parse create table stmt.");
+       }
+       createTableStmt = (CreateTableStmt) o;
+       if (createTableStmt.getColumnDescs().isEmpty()) {
+         // Should never get here.
+         throw new InternalException("Invalid create table stmt.");
+       }
+     } catch (Exception e) {
+       throw new TableLoadingException(String.format(
+           "Unsupported type '%s' in column '%s' of table '%s'",
+           fs.getType(), fs.getName(), getName()));
+     }
+     ColumnType type = createTableStmt.getColumnDescs().get(0).getColType();
+     if (type == null) {
+       throw new TableLoadingException(String.format(
+           "Unsupported type '%s' in column '%s' of table '%s'",
+           fs.getType(), fs.getName(), getName()));
+     }
+     // Return type even if !isSupported() to allow the table loading to succeed.
+     return type;
+   }
 
   /**
    * Returns true if this table is not a base table that stores data (e.g., a view).
@@ -364,7 +341,6 @@ public abstract class Table implements CatalogObject {
     for (Column column: colsByPos_.subList(0, numClusteringCols_)) {
       columns.add(column);
     }
-
     return columns;
   }
 
@@ -392,4 +368,7 @@ public abstract class Table implements CatalogObject {
   public void setCatalogVersion(long catalogVersion) {
     catalogVersion_ = catalogVersion;
   }
+
+  @Override
+  public boolean isLoaded() { return true; }
 }

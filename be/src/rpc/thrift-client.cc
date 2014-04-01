@@ -16,12 +16,14 @@
 
 #include <boost/assign.hpp>
 #include <ostream>
+#include <thrift/Thrift.h>
 
 #include "util/time.h"
 
 using namespace std;
 using namespace boost;
 using namespace apache::thrift::transport;
+using namespace apache::thrift;
 
 DECLARE_string(ssl_client_ca_certificate);
 
@@ -33,10 +35,9 @@ Status ThriftClientImpl::Open() {
     if (!transport_->isOpen()) {
       transport_->open();
     }
-  } catch (TTransportException& e) {
+  } catch (const TException& e) {
     stringstream msg;
-    msg << "Couldn't open transport for " << ipaddress() << ":" << port()
-        << "(" << e.what() << ")";
+    msg << "Couldn't open transport for " << address_ << "(" << e.what() << ")";
     return Status(msg.str());
   }
   return Status::OK;
@@ -49,7 +50,7 @@ Status ThriftClientImpl::OpenWithRetry(uint32_t num_tries, uint64_t wait_ms) {
     Status status = Open();
     if (status.ok()) return status;
 
-    LOG(INFO) << "Unable to connect to " << ipaddress_ << ":" << port_;
+    LOG(INFO) << "Unable to connect to " << address_;
     if (num_tries == 0) {
       LOG(INFO) << "(Attempt " << try_count << ", will retry indefinitely)";
     } else {
@@ -69,7 +70,7 @@ void ThriftClientImpl::Close() {
 
 Status ThriftClientImpl::CreateSocket() {
   if (!ssl_) {
-    socket_.reset(new TSocket(ipaddress_, port_));
+    socket_.reset(new TSocket(address_.hostname, address_.port));
   } else {
     try {
       TSSLSocketFactory factory;
@@ -77,8 +78,8 @@ Status ThriftClientImpl::CreateSocket() {
       // shared. But since there may be many certificates, this needs some slightly more
       // complex infrastructure to do right.
       factory.loadTrustedCertificates(FLAGS_ssl_client_ca_certificate.c_str());
-      socket_ = factory.createSocket(ipaddress_, port_);
-    } catch (const TTransportException& ex) {
+      socket_ = factory.createSocket(address_.hostname, address_.port);
+    } catch (const TException& ex) {
       stringstream err_msg;
       err_msg << "Failed to create socket: " << ex.what();
       return Status(err_msg.str());

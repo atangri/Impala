@@ -26,9 +26,9 @@ import com.cloudera.impala.authorization.Privilege;
 import com.cloudera.impala.authorization.PrivilegeRequestBuilder;
 import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.Column;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.HBaseTable;
 import com.cloudera.impala.catalog.HdfsTable;
-import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.catalog.Table;
 import com.cloudera.impala.catalog.View;
 import com.cloudera.impala.common.AnalysisException;
@@ -129,21 +129,38 @@ public class InsertStmt extends StatementBase {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException,
       AuthorizationException {
-    if (withClause_ != null) withClause_.analyze(analyzer);
+    try {
+      if (withClause_ != null) withClause_.analyze(analyzer);
+    } catch (AnalysisException e) {
+      // Ignore AnalysisExceptions if tables are missing to ensure the maximum number
+      // of missing tables can be collected before failing analyze().
+      if (analyzer.getMissingTbls().isEmpty()) throw e;
+    }
 
     analyzer.setIsExplain(isExplain_);
     if (queryStmt_ != null) queryStmt_.setIsExplain(isExplain_);
 
-    List<Expr> selectListExprs;
+    List<Expr> selectListExprs = null;
     if (!needsGeneratedQueryStatement_) {
-      queryStmt_.analyze(analyzer);
-      selectListExprs = queryStmt_.getBaseTblResultExprs();
+      try {
+        queryStmt_.analyze(analyzer);
+        selectListExprs = queryStmt_.getBaseTblResultExprs();
+      } catch (AnalysisException e) {
+        if (analyzer.getMissingTbls().isEmpty()) throw e;
+      }
     } else {
       selectListExprs = Lists.newArrayList();
     }
 
     // Set target table and perform table-type specific analysis and auth checking.
+    // Also checks if the target table is missing.
     setTargetTable(analyzer);
+
+    // Abort analysis if there are any missing tables beyond this point.
+    if (!analyzer.getMissingTbls().isEmpty()) {
+      throw new AnalysisException("Found missing tables. Aborting analysis.");
+    }
+
     boolean isHBaseTable = (table_ instanceof HBaseTable);
     int numClusteringCols = isHBaseTable ? 0 : table_.getNumClusteringCols();
 
@@ -280,14 +297,6 @@ public class InsertStmt extends StatementBase {
           table_.getFullName()));
     }
 
-    if (table_ instanceof HdfsTable) {
-      HdfsTable hdfsTable = (HdfsTable) table_;
-      if (!hdfsTable.hasWriteAccess()) {
-        throw new AnalysisException(String.format("Unable to INSERT into target table " +
-            "(%s) because Impala does not have WRITE access to at least one HDFS path" +
-            ": %s", targetTableName_, hdfsTable.getFirstLocationWithoutWriteAccess()));
-      }
-    }
 
     boolean isHBaseTable = (table_ instanceof HBaseTable);
     int numClusteringCols = isHBaseTable ? 0 : table_.getNumClusteringCols();
@@ -301,6 +310,28 @@ public class InsertStmt extends StatementBase {
         // Unpartitioned table, but INSERT has PARTITION clause
         throw new AnalysisException("PARTITION clause is only valid for INSERT into " +
             "partitioned table. '" + targetTableName_ + "' is not partitioned");
+      }
+    }
+
+    if (table_ instanceof HdfsTable) {
+      HdfsTable hdfsTable = (HdfsTable) table_;
+      if (!hdfsTable.hasWriteAccess()) {
+        throw new AnalysisException(String.format("Unable to INSERT into target table " +
+            "(%s) because Impala does not have WRITE access to at least one HDFS path" +
+            ": %s", targetTableName_, hdfsTable.getFirstLocationWithoutWriteAccess()));
+      }
+
+      for (int colIdx = 0; colIdx < numClusteringCols; ++colIdx) {
+        Column col = hdfsTable.getColumns().get(colIdx);
+        // Hive has a number of issues handling BOOLEAN partition columns (see HIVE-6590).
+        // Instead of working around the Hive bugs, INSERT is disabled for BOOLEAN
+        // partitions in Impala. Once the Hive JIRA is resolved, we can remove this
+        // analysis check.
+        if (col.getType() == ColumnType.BOOLEAN) {
+          throw new AnalysisException(String.format("INSERT into table with BOOLEAN " +
+              "partition column (%s) is not supported: %s", col.getName(),
+              targetTableName_));
+        }
       }
     }
 
@@ -495,14 +526,13 @@ public class InsertStmt extends StatementBase {
       throws AnalysisException {
     // Check for compatible type, and add casts to the selectListExprs if necessary.
     // We don't allow casting to a lower precision type.
-    PrimitiveType colType = column.getType();
-    PrimitiveType exprType = expr.getType();
+    ColumnType colType = column.getType();
+    ColumnType exprType = expr.getType();
     // Trivially compatible.
-    if (colType == exprType) {
-      return expr;
-    }
-    PrimitiveType compatibleType =
-        PrimitiveType.getAssignmentCompatibleType(colType, exprType);
+    if (colType.equals(exprType)) return expr;
+
+    ColumnType compatibleType =
+        ColumnType.getAssignmentCompatibleType(colType, exprType);
     // Incompatible types.
     if (!compatibleType.isValid()) {
       throw new AnalysisException(
@@ -512,7 +542,7 @@ public class InsertStmt extends StatementBase {
             targetTableName_, expr.toSql(), exprType, column.getName(), colType));
     }
     // Loss of precision when inserting into the table.
-    if (compatibleType != colType && !compatibleType.isNull()) {
+    if (!compatibleType.equals(colType) && !compatibleType.isNull()) {
       throw new AnalysisException(
           String.format("Possible loss of precision for target table '%s'.\n" +
                         "Expression '%s' (type: %s) would need to be cast to %s" +
@@ -521,8 +551,7 @@ public class InsertStmt extends StatementBase {
                         column.getName()));
     }
     // Add a cast to the selectListExpr to the higher type.
-    Expr castExpr = expr.castTo(compatibleType);
-    return castExpr;
+    return expr.castTo(compatibleType);
   }
 
   private void analyzePlanHints() throws AnalysisException {

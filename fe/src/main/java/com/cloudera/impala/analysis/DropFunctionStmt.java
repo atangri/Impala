@@ -16,8 +16,8 @@ package com.cloudera.impala.analysis;
 
 import com.cloudera.impala.authorization.Privilege;
 import com.cloudera.impala.catalog.AuthorizationException;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.Function;
-import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.thrift.TDropFunctionParams;
 
@@ -36,7 +36,7 @@ public class DropFunctionStmt extends StatementBase {
    */
   public DropFunctionStmt(FunctionName fnName, FunctionArgs fnArgs, boolean ifExists) {
     desc_ = new Function(
-        fnName, fnArgs.argTypes, PrimitiveType.INVALID_TYPE, fnArgs.hasVarArgs);
+        fnName, fnArgs.argTypes, ColumnType.INVALID, fnArgs.hasVarArgs);
     ifExists_ = ifExists;
   }
 
@@ -55,8 +55,9 @@ public class DropFunctionStmt extends StatementBase {
   public TDropFunctionParams toThrift() {
     TDropFunctionParams params = new TDropFunctionParams();
     params.setFn_name(desc_.getFunctionName().toThrift());
-    params.setArg_types(PrimitiveType.toThrift(desc_.getArgs()));
+    params.setArg_types(ColumnType.toThrift(desc_.getArgs()));
     params.setIf_exists(getIfExists());
+    params.setSignature(desc_.signatureString());
     return params;
   }
 
@@ -69,11 +70,9 @@ public class DropFunctionStmt extends StatementBase {
     analyzer.getCatalog().checkCreateDropFunctionAccess(analyzer.getUser());
 
     desc_.getFunctionName().analyze(analyzer);
-    String dbName = analyzer.getTargetDbName(desc_.getFunctionName());
-    desc_.getFunctionName().setDb(dbName);
-    if (analyzer.getCatalog().getDb(dbName, analyzer.getUser(), Privilege.DROP) == null
-        && !ifExists_) {
-      throw new AnalysisException(Analyzer.DB_DOES_NOT_EXIST_ERROR_MSG + dbName);
+    if (analyzer.getCatalog().getDb(
+          desc_.dbName(), analyzer.getUser(), Privilege.DROP) == null && !ifExists_) {
+      throw new AnalysisException(Analyzer.DB_DOES_NOT_EXIST_ERROR_MSG + desc_.dbName());
     }
 
     if (analyzer.getCatalog().getFunction(

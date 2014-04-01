@@ -23,7 +23,9 @@
 #include "common/status.h"
 #include "exprs/timestamp-functions.h"
 #include "runtime/client-cache.h"
+#include "util/cgroups-mgr.h"
 #include "util/hdfs-bulk-ops.h" // For declaration of HdfsOpThreadPool
+#include "resourcebroker/resource-broker.h"
 
 namespace impala {
 
@@ -39,6 +41,9 @@ class Webserver;
 class Metrics;
 class MemTracker;
 class ThreadResourceMgr;
+class CgroupsManager;
+class ImpalaServer;
+class RequestPoolService;
 
 // Execution environment for queries/plan fragments.
 // Contains all required global structures, and handles to
@@ -60,6 +65,8 @@ class ExecEnv {
   // declarations for classes in scoped_ptrs.
   virtual ~ExecEnv();
 
+  void SetImpalaServer(ImpalaServer* server) { impala_server_ = server; }
+
   StatestoreSubscriber* statestore_subscriber() {
     return statestore_subscriber_.get();
   }
@@ -71,46 +78,53 @@ class ExecEnv {
   CatalogServiceClientCache* catalogd_client_cache() {
     return catalogd_client_cache_.get();
   }
-  HdfsFsCache* fs_cache() { return fs_cache_.get(); }
-  LibCache* lib_cache() { return lib_cache_.get(); }
   HBaseTableFactory* htable_factory() { return htable_factory_.get(); }
   DiskIoMgr* disk_io_mgr() { return disk_io_mgr_.get(); }
   Webserver* webserver() { return webserver_.get(); }
   Metrics* metrics() { return metrics_.get(); }
   MemTracker* process_mem_tracker() { return mem_tracker_.get(); }
   ThreadResourceMgr* thread_mgr() { return thread_mgr_.get(); }
+  CgroupsMgr* cgroups_mgr() { return cgroups_mgr_.get(); }
   HdfsOpThreadPool* hdfs_op_thread_pool() { return hdfs_op_thread_pool_.get(); }
+  ImpalaServer* impala_server() { return impala_server_; }
 
   void set_enable_webserver(bool enable) { enable_webserver_ = enable; }
 
+  ResourceBroker* resource_broker() { return resource_broker_.get(); }
   Scheduler* scheduler() { return scheduler_.get(); }
   StatestoreSubscriber* subscriber() { return statestore_subscriber_.get(); }
 
   // Starts any dependent services in their correct order
   virtual Status StartServices();
 
+  // Initializes the exec env for running FE tests.
+  Status InitForFeTests();
+
   // Returns true if this environment was created from the FE tests. This makes the
   // environment special since the JVM is started first and libraries are loaded
   // differently.
   bool is_fe_tests() { return is_fe_tests_; }
-  void set_is_fe_tests(bool v) { is_fe_tests_ = v; }
 
  protected:
   // Leave protected so that subclasses can override
   boost::scoped_ptr<DataStreamMgr> stream_mgr_;
+  boost::scoped_ptr<ResourceBroker> resource_broker_;
   boost::scoped_ptr<Scheduler> scheduler_;
   boost::scoped_ptr<StatestoreSubscriber> statestore_subscriber_;
   boost::scoped_ptr<ImpalaInternalServiceClientCache> impalad_client_cache_;
   boost::scoped_ptr<CatalogServiceClientCache> catalogd_client_cache_;
-  boost::scoped_ptr<HdfsFsCache> fs_cache_;
-  boost::scoped_ptr<LibCache> lib_cache_;
   boost::scoped_ptr<HBaseTableFactory> htable_factory_;
   boost::scoped_ptr<DiskIoMgr> disk_io_mgr_;
   boost::scoped_ptr<Webserver> webserver_;
   boost::scoped_ptr<Metrics> metrics_;
   boost::scoped_ptr<MemTracker> mem_tracker_;
   boost::scoped_ptr<ThreadResourceMgr> thread_mgr_;
+  boost::scoped_ptr<CgroupsMgr> cgroups_mgr_;
   boost::scoped_ptr<HdfsOpThreadPool> hdfs_op_thread_pool_;
+  boost::scoped_ptr<RequestPoolService> request_pool_service_;
+
+  // Not owned by this class
+  ImpalaServer* impala_server_;
 
   bool enable_webserver_;
 

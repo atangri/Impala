@@ -78,6 +78,11 @@ class ImpalaConnection(object):
     pass
 
   @abc.abstractmethod
+  def close_query(self, handle):
+    """Closes the query."""
+    pass
+
+  @abc.abstractmethod
   def get_state(self, operation_handle):
     """Returns the state of a query"""
     pass
@@ -102,9 +107,10 @@ class ImpalaConnection(object):
     pass
 
   @abc.abstractmethod
-  def fetch(self, sql_stmt, operation_handle, batch_size=1024):
-    """Fetches all query results given a handle and sql statement.
-    TODO: Support fetching single batch"""
+  def fetch(self, sql_stmt, operation_handle, max_rows=-1):
+    """Fetches query results up to max_rows given a handle and sql statement.
+    If max_rows < 0, all rows are fetched. If max_rows > 0 but the number of
+    rows returned is less than max_rows, all the rows have been fetched."""
     pass
 
 
@@ -137,9 +143,14 @@ class BeeswaxConnection(ImpalaConnection):
     LOG.info("-- connecting to: %s" % self.__host_port)
     self.__beeswax_client.connect()
 
+  # TODO: rename to close_connection
   def close(self):
     LOG.info("-- closing connection to: %s" % self.__host_port)
     self.__beeswax_client.close_connection()
+
+  def close_query(self, operation_handle):
+    LOG.info("-- closing query for operation handle: %s" % operation_handle)
+    self.__beeswax_client.close_query(operation_handle.get_handle())
 
   def execute(self, sql_stmt):
     LOG.info("-- executing against %s\n%s;\n" % (self.__host_port, sql_stmt))
@@ -169,9 +180,10 @@ class BeeswaxConnection(ImpalaConnection):
     """Refresh a specific table from the catalog"""
     return self.execute("refresh %s.%s" % (db_name, table_name))
 
-  def fetch(self, sql_stmt, operation_handle):
+  def fetch(self, sql_stmt, operation_handle, max_rows = -1):
     LOG.info("-- fetching results from: %s" % operation_handle)
-    return self.__beeswax_client.fetch_results(sql_stmt, operation_handle.get_handle())
+    return self.__beeswax_client.fetch_results(
+        sql_stmt, operation_handle.get_handle(), max_rows)
 
 def create_connection(host_port, use_kerberos=False):
   # TODO: Support HS2 connections.

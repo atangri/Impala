@@ -112,8 +112,7 @@ Status AggregationNode::Prepare(RuntimeState* state) {
       ++j;
     }
     SlotDescriptor* desc = agg_tuple_desc_->slots()[j];
-    RETURN_IF_ERROR(aggregate_evaluators_[i]->Prepare(state, child(0)->row_desc(),
-        tuple_pool_.get(), desc));
+    RETURN_IF_ERROR(aggregate_evaluators_[i]->Prepare(state, child(0)->row_desc(), desc));
   }
 
   // TODO: how many buckets?
@@ -124,6 +123,8 @@ Status AggregationNode::Prepare(RuntimeState* state) {
     // create single output tuple now; we need to output something
     // even if our input is empty
     singleton_output_tuple_ = ConstructAggTuple();
+    hash_tbl_->Insert(reinterpret_cast<TupleRow*>(&singleton_output_tuple_));
+    output_iterator_ = hash_tbl_->Begin();
   }
 
   if (state->codegen_enabled()) {
@@ -145,14 +146,20 @@ Status AggregationNode::Prepare(RuntimeState* state) {
 }
 
 Status AggregationNode::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
+  RETURN_IF_ERROR(ExecNode::Open(state));
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+
+  RETURN_IF_ERROR(Expr::Open(probe_exprs_, state));
+  RETURN_IF_ERROR(Expr::Open(build_exprs_, state));
+
+  for (int i = 0; i < aggregate_evaluators_.size(); ++i) {
+    RETURN_IF_ERROR(aggregate_evaluators_[i]->Open(state));
+  }
 
   RETURN_IF_ERROR(children_[0]->Open(state));
 
   RowBatch batch(children_[0]->row_desc(), state->batch_size(), mem_tracker());
   int64_t num_input_rows = 0;
-  int64_t num_agg_rows = 0;
   while (true) {
     bool eos;
     RETURN_IF_CANCELLED(state);
@@ -166,18 +173,19 @@ Status AggregationNode::Open(RuntimeState* state) {
         VLOG_ROW << "input row: " << PrintRow(row, children_[0]->row_desc());
       }
     }
-    int64_t agg_rows_before = hash_tbl_->size();
     if (process_row_batch_fn_ != NULL) {
       process_row_batch_fn_(this, &batch);
-    } else if (singleton_output_tuple_ != NULL) {
+    } else if (probe_exprs_.empty()) {
       ProcessRowBatchNoGrouping(&batch);
     } else {
       ProcessRowBatchWithGrouping(&batch);
     }
     COUNTER_SET(hash_table_buckets_counter_, hash_tbl_->num_buckets());
     COUNTER_SET(hash_table_load_factor_counter_, hash_tbl_->load_factor());
-    num_agg_rows += (hash_tbl_->size() - agg_rows_before);
     num_input_rows += batch.num_rows();
+    // We must set output_iterator_ here, rather than outside the loop, because
+    // output_iterator_ must be set if the function returns within the loop
+    output_iterator_ = hash_tbl_->Begin();
 
     batch.Reset();
     RETURN_IF_ERROR(state->CheckQueryState());
@@ -187,13 +195,8 @@ Status AggregationNode::Open(RuntimeState* state) {
   // We have consumed all of the input from the child and transfered ownership of the
   // resources we need, so the child can be closed safely to release its resources.
   child(0)->Close(state);
-  if (singleton_output_tuple_ != NULL) {
-    hash_tbl_->Insert(reinterpret_cast<TupleRow*>(&singleton_output_tuple_));
-    ++num_agg_rows;
-  }
   VLOG_FILE << "aggregated " << num_input_rows << " input rows into "
-            << num_agg_rows << " output rows";
-  output_iterator_ = hash_tbl_->Begin();
+            << hash_tbl_->size() << " output rows";
   return Status::OK;
 }
 
@@ -211,11 +214,12 @@ Status AggregationNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* 
   Expr** conjuncts = &conjuncts_[0];
   int num_conjuncts = conjuncts_.size();
 
-  while (!output_iterator_.AtEnd() && !row_batch->IsFull()) {
+  while (!output_iterator_.AtEnd() && !row_batch->AtCapacity()) {
     int row_idx = row_batch->AddRow();
     TupleRow* row = row_batch->GetRow(row_idx);
     Tuple* agg_tuple = output_iterator_.GetRow()->GetTuple(0);
     FinalizeAggTuple(agg_tuple);
+    output_iterator_.Next<false>();
     row->SetTuple(0, agg_tuple);
     if (ExecNode::EvalConjuncts(conjuncts, num_conjuncts, row)) {
       VLOG_ROW << "output row: " << PrintRow(row, row_desc());
@@ -223,7 +227,6 @@ Status AggregationNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* 
       ++num_rows_returned_;
       if (ReachedLimit()) break;
     }
-    output_iterator_.Next<false>();
   }
   *eos = output_iterator_.AtEnd() || ReachedLimit();
   COUNTER_SET(rows_returned_counter_, num_rows_returned_);
@@ -232,8 +235,22 @@ Status AggregationNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* 
 
 void AggregationNode::Close(RuntimeState* state) {
   if (is_closed()) return;
+
+  // Iterate through the remaining rows in the hash table and call Serialize/Finalize on
+  // them in order to free any memory allocated by UDAs
+  while (!output_iterator_.AtEnd()) {
+    Tuple* agg_tuple = output_iterator_.GetRow()->GetTuple(0);
+    FinalizeAggTuple(agg_tuple);
+    output_iterator_.Next<false>();
+  }
+
   if (tuple_pool_.get() != NULL) tuple_pool_->FreeAll();
   if (hash_tbl_.get() != NULL) hash_tbl_->Close();
+  for (int i = 0; i < aggregate_evaluators_.size(); ++i) {
+    aggregate_evaluators_[i]->Close(state);
+  }
+  Expr::Close(probe_exprs_, state);
+  Expr::Close(build_exprs_, state);
   ExecNode::Close(state);
 }
 
@@ -266,16 +283,17 @@ Tuple* AggregationNode::ConstructAggTuple() {
     //  - max: min_value
     // TODO: remove when we don't use the irbuilder for codegen here.
     // This optimization no longer applies with AnyVal
-    if ((*slot_desc)->type() != TYPE_STRING && (*slot_desc)->type() != TYPE_TIMESTAMP
-        && (*slot_desc)->type() != TYPE_CHAR) {
+    if ((*slot_desc)->type().type != TYPE_STRING &&
+        (*slot_desc)->type().type != TYPE_TIMESTAMP &&
+        (*slot_desc)->type().type != TYPE_CHAR) {
       ExprValue default_value;
       void* default_value_ptr = NULL;
       switch (evaluator->agg_op()) {
-        case TAggregationOp::MIN:
+        case AggFnEvaluator::MIN:
           default_value_ptr = default_value.SetToMax((*slot_desc)->type());
           RawValue::Write(default_value_ptr, agg_tuple, *slot_desc, NULL);
           break;
-        case TAggregationOp::MAX:
+        case AggFnEvaluator::MAX:
           default_value_ptr = default_value.SetToMin((*slot_desc)->type());
           RawValue::Write(default_value_ptr, agg_tuple, *slot_desc, NULL);
           break;
@@ -288,7 +306,7 @@ Tuple* AggregationNode::ConstructAggTuple() {
 }
 
 void AggregationNode::UpdateAggTuple(Tuple* tuple, TupleRow* row) {
-  DCHECK(tuple != NULL);
+  DCHECK(tuple != NULL || aggregate_evaluators_.empty());
   for (vector<AggFnEvaluator*>::const_iterator evaluator = aggregate_evaluators_.begin();
       evaluator != aggregate_evaluators_.end(); ++evaluator) {
     if (is_merge_) {
@@ -300,7 +318,7 @@ void AggregationNode::UpdateAggTuple(Tuple* tuple, TupleRow* row) {
 }
 
 void AggregationNode::FinalizeAggTuple(Tuple* tuple) {
-  DCHECK(tuple != NULL);
+  DCHECK(tuple != NULL || aggregate_evaluators_.empty());
   for (vector<AggFnEvaluator*>::const_iterator evaluator = aggregate_evaluators_.begin();
       evaluator != aggregate_evaluators_.end(); ++evaluator) {
     if (needs_finalize_) {
@@ -395,24 +413,24 @@ llvm::Function* AggregationNode::CodegenUpdateSlot(
   // Update the slot
   Value* dst_value = builder.CreateLoad(dst_ptr, "dst_val");
   switch (evaluator->agg_op()) {
-    case TAggregationOp::COUNT:
+    case AggFnEvaluator::COUNT:
       result = builder.CreateAdd(dst_value,
           codegen->GetIntConstant(TYPE_BIGINT, 1), "count_inc");
       break;
-    case TAggregationOp::MIN: {
+    case AggFnEvaluator::MIN: {
       Function* min_fn = codegen->CodegenMinMax(slot_desc->type(), true);
       Value* min_args[] = { dst_value, src_value };
       result = builder.CreateCall(min_fn, min_args, "min_value");
       break;
     }
-    case TAggregationOp::MAX: {
+    case AggFnEvaluator::MAX: {
       Function* max_fn = codegen->CodegenMinMax(slot_desc->type(), false);
       Value* max_args[] = { dst_value, src_value };
       result = builder.CreateCall(max_fn, max_args, "max_value");
       break;
     }
-    case TAggregationOp::SUM:
-      if (slot_desc->type() == TYPE_FLOAT || slot_desc->type() == TYPE_DOUBLE) {
+    case AggFnEvaluator::SUM:
+      if (slot_desc->type().type == TYPE_FLOAT || slot_desc->type().type == TYPE_DOUBLE) {
         result = builder.CreateFAdd(dst_value, src_value);
       } else {
         result = builder.CreateAdd(dst_value, src_value);
@@ -474,8 +492,9 @@ Function* AggregationNode::CodegenUpdateAggTuple(LlvmCodeGen* codegen) {
     AggFnEvaluator* evaluator = aggregate_evaluators_[i];
 
     // string and timestamp aggregation currently not supported
-    if (slot_desc->type() == TYPE_STRING || slot_desc->type() == TYPE_TIMESTAMP ||
-        slot_desc->type() == TYPE_CHAR) {
+    if (slot_desc->type().type == TYPE_STRING ||
+        slot_desc->type().type == TYPE_TIMESTAMP ||
+        slot_desc->type().type == TYPE_CHAR) {
       VLOG_QUERY << "Could not codegen UpdateAggTuple because "
                  << "string, char and timestamp aggregation is not yet supported.";
       return NULL;
@@ -491,12 +510,6 @@ Function* AggregationNode::CodegenUpdateAggTuple(LlvmCodeGen* codegen) {
 
     // Don't codegen things that aren't builtins (for now)
     if (!evaluator->is_builtin()) return NULL;
-
-    // Don't code gen distinct estimate
-    if (evaluator->agg_op() == TAggregationOp::DISTINCT_PC
-        || evaluator->agg_op() == TAggregationOp::DISTINCT_PCSA) {
-      return NULL;
-    }
   }
 
   if (agg_tuple_desc_->GenerateLlvmStruct(codegen) == NULL) {
@@ -565,7 +578,8 @@ Function* AggregationNode::CodegenUpdateAggTuple(LlvmCodeGen* codegen) {
   }
   builder.CreateRetVoid();
 
-  return codegen->OptimizeFunctionWithExprs(fn);
+  // CodegenProcessRowBatch() does the final optimizations.
+  return codegen->FinalizeFunction(fn);
 }
 
 Function* AggregationNode::CodegenProcessRowBatch(
@@ -574,7 +588,7 @@ Function* AggregationNode::CodegenProcessRowBatch(
   DCHECK(update_tuple_fn != NULL);
 
   // Get the cross compiled update row batch function
-  IRFunction::Type ir_fn = (singleton_output_tuple_ == NULL ?
+  IRFunction::Type ir_fn = (!probe_exprs_.empty() ?
       IRFunction::AGG_NODE_PROCESS_ROW_BATCH_WITH_GROUPING :
       IRFunction::AGG_NODE_PROCESS_ROW_BATCH_NO_GROUPING);
   Function* process_batch_fn = codegen->GetFunction(ir_fn);
@@ -585,7 +599,7 @@ Function* AggregationNode::CodegenProcessRowBatch(
   }
 
   int replaced = 0;
-  if (singleton_output_tuple_ == NULL) {
+  if (!probe_exprs_.empty()) {
     // Aggregation w/o grouping does not use a hash table.
 
     // Codegen for hash
@@ -631,4 +645,3 @@ Function* AggregationNode::CodegenProcessRowBatch(
 }
 
 }
-

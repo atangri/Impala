@@ -24,8 +24,7 @@
 #include "runtime/exec-env.h"
 #include "service/impala-server.h"
 
-using namespace ::apache::thrift::server;
-using namespace ::apache::thrift::transport;
+using namespace apache::thrift;
 
 using namespace std;
 using namespace boost;
@@ -38,6 +37,11 @@ InProcessImpalaServer::InProcessImpalaServer(const string& hostname, int backend
     impala_server_(NULL),
     exec_env_(new ExecEnv(hostname, backend_port, subscriber_port, webserver_port,
                           statestore_host, statestore_port)) {
+}
+
+void InProcessImpalaServer::SetCatalogInitialized() {
+  DCHECK(impala_server_ != NULL) << "Call Start*() first.";
+  impala_server_->frontend()->SetCatalogInitialized();
 }
 
 Status InProcessImpalaServer::StartWithClientServers(int beeswax_port, int hs2_port,

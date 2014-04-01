@@ -70,9 +70,9 @@ public class TableName {
     // Enclose the database and/or table name in quotes if Hive cannot parse them
     // without quotes. This is needed for view compatibility between Impala and Hive.
     if (db_ == null) {
-      return ToSqlUtils.getHiveIdentSql(tbl_);
+      return ToSqlUtils.getIdentSql(tbl_);
     } else {
-      return ToSqlUtils.getHiveIdentSql(db_) + "." + ToSqlUtils.getHiveIdentSql(tbl_);
+      return ToSqlUtils.getIdentSql(db_) + "." + ToSqlUtils.getIdentSql(tbl_);
     }
   }
 
@@ -90,4 +90,21 @@ public class TableName {
   }
 
   public TTableName toThrift() { return new TTableName(db_, tbl_); }
+
+  /**
+   * Returns true of the table names are considered equals. To check for equality,
+   * a case-insensitive comparison of the database and table name is performed.
+   */
+  @Override
+  public boolean equals(Object anObject) {
+    if (anObject instanceof TableName) {
+      return toString().toLowerCase().equals(anObject.toString().toLowerCase());
+    }
+    return false;
+  }
+
+  @Override
+  public int hashCode() {
+    return toString().toLowerCase().hashCode();
+  }
 }

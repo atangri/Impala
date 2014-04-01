@@ -48,7 +48,14 @@ IntVal AllTypes(
 }
 
 StringVal NoArgs(FunctionContext* context) {
-  return StringVal(reinterpret_cast<uint8_t*>(const_cast<char*>("string")), 6);
+  const char* result = "string";
+  StringVal ret(context, strlen(result));
+  // TODO: llvm 3.3 seems to have a bug if we use memcpy here making
+  // the IR udf crash. This is fixed in 3.3.1. Fix this when we upgrade.
+  //memcpy(ret.ptr, result, strlen(result));
+  // IMPALA-775
+  for (int i = 0; i < strlen(result); ++i) ret.ptr[i] = result[i];
+  return ret;
 }
 
 BooleanVal VarAnd(FunctionContext* context, int n, const BooleanVal* args) {
@@ -132,4 +139,121 @@ IntVal Fn2(FunctionContext*, const IntVal&, const StringVal&) { return IntVal::n
 
 TimestampVal ConstantTimestamp(FunctionContext* context) {
   return TimestampVal(2456575, 1); // 2013-10-09 00:00:00.000000001
+}
+
+BooleanVal ValidateArgType(FunctionContext* context, const StringVal& dummy) {
+  if (context->GetArgType(0)->type != FunctionContext::TYPE_STRING) {
+    return BooleanVal(false);
+  }
+  if (context->GetArgType(-1) != NULL) return BooleanVal(false);
+  if (context->GetArgType(1) != NULL) return BooleanVal(false);
+  return BooleanVal(true);
+}
+
+// Count UDF: counts the number of input rows per thread-local FunctionContext
+void CountPrepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    uint64_t* state = reinterpret_cast<uint64_t*>(context->Allocate(sizeof(uint64_t)));
+    *state = 0;
+    context->SetFunctionState(scope, state);
+  }
+}
+
+BigIntVal Count(FunctionContext* context) {
+  uint64_t* state = reinterpret_cast<uint64_t*>(
+      context->GetFunctionState(FunctionContext::THREAD_LOCAL));
+  return BigIntVal(++(*state));
+}
+
+void CountClose(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    void* state = context->GetFunctionState(scope);
+    context->Free(reinterpret_cast<uint8_t*>(state));
+    context->SetFunctionState(scope, NULL);
+  }
+}
+
+// ConstantArg UDF: returns the first argument if it's constant, otherwise returns NULL.
+void ConstantArgPrepare(
+    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    IntVal* arg = reinterpret_cast<IntVal*>(context->GetConstantArg(0));
+    IntVal* state = reinterpret_cast<IntVal*>(context->Allocate(sizeof(IntVal)));
+    *state = (arg != NULL) ? *arg : IntVal::null();
+    context->SetFunctionState(scope, state);
+  }
+}
+
+IntVal ConstantArg(FunctionContext* context, const IntVal& const_val) {
+  IntVal* state = reinterpret_cast<IntVal*>(
+      context->GetFunctionState(FunctionContext::THREAD_LOCAL));
+  return *state;
+}
+
+void ConstantArgClose(
+    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    void* state = context->GetFunctionState(scope);
+    context->Free(reinterpret_cast<uint8_t*>(state));
+    context->SetFunctionState(scope, NULL);
+  }
+}
+
+// ValidateOpen UDF: returns true if the UDF was opened, false otherwise. Can also be
+// used to validate close since it will leak if it's not closed.
+void ValidateOpenPrepare(
+    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    uint8_t* state = context->Allocate(100);
+    context->SetFunctionState(scope, state);
+  }
+}
+
+BooleanVal ValidateOpen(FunctionContext* context, const IntVal& dummy) {
+  void* state = context->GetFunctionState(FunctionContext::THREAD_LOCAL);
+  return BooleanVal(state != NULL);
+}
+
+void ValidateOpenClose(
+    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    void* state = context->GetFunctionState(scope);
+    context->Free(reinterpret_cast<uint8_t*>(state));
+    context->SetFunctionState(scope, NULL);
+  }
+}
+
+// MemTest UDF: "Allocates" the specified number of bytes per call.
+void MemTestPrepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    int64_t* total =
+        reinterpret_cast<int64_t*>(context->Allocate(sizeof(int64_t)));
+    *total = 0;
+    context->SetFunctionState(scope, total);
+  }
+}
+
+BigIntVal MemTest(FunctionContext* context, const BigIntVal& bytes) {
+  int64_t* total = reinterpret_cast<int64_t*>(
+      context->GetFunctionState(FunctionContext::THREAD_LOCAL));
+  context->TrackAllocation(bytes.val);
+  *total += bytes.val;
+  return bytes;
+}
+
+void MemTestClose(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    int64_t* total = reinterpret_cast<int64_t*>(
+        context->GetFunctionState(FunctionContext::THREAD_LOCAL));
+    context->Free(*total);
+    context->Free(reinterpret_cast<uint8_t*>(total));
+    context->SetFunctionState(scope, NULL);
+  }
+}
+
+BigIntVal DoubleFreeTest(FunctionContext* context, BigIntVal bytes) {
+  context->TrackAllocation(bytes.val);
+  context->Free(bytes.val);
+  context->Free(bytes.val);
+  return bytes;
 }

@@ -202,7 +202,7 @@ void DataStreamSender::Channel::TransmitDataHelper(const TRowBatch* batch) {
       SCOPED_TIMER(parent_->thrift_transmit_timer_);
       try {
         client->TransmitData(res, params);
-      } catch (TTransportException& e) {
+      } catch (const TException& e) {
         VLOG_RPC << "Retrying TransmitData: " << e.what();
         rpc_status_ = client.Reopen();
         if (!rpc_status_.ok()) {
@@ -228,7 +228,7 @@ void DataStreamSender::Channel::TransmitDataHelper(const TRowBatch* batch) {
 }
 
 void DataStreamSender::Channel::WaitForRpc() {
-  SCOPED_TIMER(parent_->state_->total_network_wait_timer());
+  SCOPED_TIMER(parent_->state_->total_network_send_timer());
   unique_lock<mutex> l(rpc_thread_lock_);
   while (rpc_in_flight_) {
     rpc_done_cv_.wait(l);
@@ -309,7 +309,7 @@ Status DataStreamSender::Channel::CloseInternal() {
     VLOG_RPC << "calling TransmitData to close channel";
     try {
       client->TransmitData(res, params);
-    } catch (TTransportException& e) {
+    } catch (const TException& e) {
       VLOG_RPC << "Retrying TransmitData: " << e.what();
       rpc_status_ = client.Reopen();
       if (!rpc_status_.ok()) {
@@ -380,7 +380,7 @@ DataStreamSender::~DataStreamSender() {
   }
 }
 
-Status DataStreamSender::Init(RuntimeState* state) {
+Status DataStreamSender::Prepare(RuntimeState* state) {
   DCHECK(state != NULL);
   state_ = state;
   stringstream title;
@@ -412,6 +412,10 @@ Status DataStreamSender::Init(RuntimeState* state) {
     RETURN_IF_ERROR(channels_[i]->Init(state));
   }
   return Status::OK;
+}
+
+Status DataStreamSender::Open(RuntimeState* state) {
+  return Expr::Open(partition_exprs_, state);
 }
 
 Status DataStreamSender::Send(RuntimeState* state, RowBatch* batch, bool eos) {
@@ -462,6 +466,7 @@ void DataStreamSender::Close(RuntimeState* state) {
   for (int i = 0; i < channels_.size(); ++i) {
     channels_[i]->Close(state);
   }
+  Expr::Close(partition_exprs_, state);
   closed_ = true;
 }
 

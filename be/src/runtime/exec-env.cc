@@ -18,9 +18,9 @@
 
 #include <boost/algorithm/string.hpp>
 #include <gflags/gflags.h>
-#include <gutil/strings/substitute.h>
 
 #include "common/logging.h"
+#include "resourcebroker/resource-broker.h"
 #include "runtime/client-cache.h"
 #include "runtime/data-stream-mgr.h"
 #include "runtime/disk-io-mgr.h"
@@ -29,6 +29,7 @@
 #include "runtime/lib-cache.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/thread-resource-mgr.h"
+#include "scheduling/request-pool-service.h"
 #include "statestore/simple-scheduler.h"
 #include "statestore/statestore-subscriber.h"
 #include "util/debug-util.h"
@@ -39,12 +40,14 @@
 #include "util/parse-util.h"
 #include "util/memory-metrics.h"
 #include "util/webserver.h"
+#include "util/mem-info.h"
+#include "util/debug-util.h"
+#include "util/cgroups-mgr.h"
 #include "gen-cpp/ImpalaInternalService.h"
 #include "gen-cpp/CatalogService.h"
 
 using namespace std;
 using namespace boost;
-using namespace strings;
 
 DEFINE_bool(use_statestore, true,
     "Use an external statestore process to manage cluster membership");
@@ -64,6 +67,31 @@ DECLARE_int32(num_cores);
 DECLARE_int32(be_port);
 DECLARE_string(mem_limit);
 
+DEFINE_bool(enable_rm, false, "Whether to enable resource management. If enabled, "
+                              "-fair_scheduler_allocation_path is required.");
+DEFINE_int32(llama_callback_port, 28000,
+             "Port where Llama notification callback should be started");
+DEFINE_string(llama_host, "127.0.0.1",
+              "Host of Llama service that the resource broker should connect to");
+DEFINE_int32(llama_port, 15000,
+             "Port of Llama service that the resource broker should connect to");
+DEFINE_string(cgroup_hierarchy_path, "", "If Resource Management is enabled, this must "
+    "be set to the Impala-writeable root of the cgroups hierarchy into which execution "
+    "threads are assigned.");
+DEFINE_string(staging_cgroup, "impala_staging", "Name of the cgroup that a query's "
+    "execution threads are moved into once the query completes.");
+
+DEFINE_int32(resource_broker_cnxn_attempts, 10, "The number of times to retry an "
+    "RPC connection to Llama. A setting of 0 means retry indefinitely");
+DEFINE_int32(resource_broker_cnxn_retry_interval_ms, 3000, "The interval, in ms, "
+    "to wait between attempts to make an RPC connection to the Llama.");
+DEFINE_int32(resource_broker_send_timeout, 0, "Time to wait, in ms, "
+    "for the underlying socket of an RPC to Llama to successfully send data. "
+    "A setting of 0 means the socket will wait indefinitely.");
+DEFINE_int32(resource_broker_recv_timeout, 0, "Time to wait, in ms, "
+    "for the underlying socket of an RPC to Llama to successfully receive data. "
+    "A setting of 0 means the socket will wait indefinitely.");
+
 namespace impala {
 
 ExecEnv* ExecEnv::exec_env_ = NULL;
@@ -72,19 +100,28 @@ ExecEnv::ExecEnv()
   : stream_mgr_(new DataStreamMgr()),
     impalad_client_cache_(new ImpalaInternalServiceClientCache()),
     catalogd_client_cache_(new CatalogServiceClientCache()),
-    fs_cache_(new HdfsFsCache()),
-    lib_cache_(new LibCache()),
     htable_factory_(new HBaseTableFactory()),
     disk_io_mgr_(new DiskIoMgr()),
     webserver_(new Webserver()),
     metrics_(new Metrics()),
     mem_tracker_(NULL),
     thread_mgr_(new ThreadResourceMgr),
+    cgroups_mgr_(NULL),
     hdfs_op_thread_pool_(
         CreateHdfsOpThreadPool("hdfs-worker-pool", FLAGS_num_hdfs_worker_threads, 1024)),
+    request_pool_service_(new RequestPoolService()),
     enable_webserver_(FLAGS_enable_webserver),
     tz_database_(TimezoneDatabase()),
     is_fe_tests_(false) {
+  if (FLAGS_enable_rm) {
+    TNetworkAddress llama_address =
+        MakeNetworkAddress(FLAGS_llama_host, FLAGS_llama_port);
+    TNetworkAddress llama_callback_address =
+        MakeNetworkAddress(FLAGS_hostname, FLAGS_llama_callback_port);
+    resource_broker_.reset(new ResourceBroker(llama_address, llama_callback_address,
+        metrics_.get()));
+    cgroups_mgr_.reset(new CgroupsMgr(metrics_.get()));
+  }
   // Initialize the scheduler either dynamically (with a statestore) or statically (with
   // a standalone single backend)
   if (FLAGS_use_statestore) {
@@ -95,18 +132,20 @@ ExecEnv::ExecEnv()
     TNetworkAddress backend_address = MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port);
 
     statestore_subscriber_.reset(new StatestoreSubscriber(
-        Substitute("impalad@$0", TNetworkAddressToString(backend_address)),
-        subscriber_address, statestore_address, metrics_.get()));
+        TNetworkAddressToString(backend_address), subscriber_address, statestore_address,
+        metrics_.get()));
 
     scheduler_.reset(new SimpleScheduler(statestore_subscriber_.get(),
         statestore_subscriber_->id(), backend_address, metrics_.get(),
-        webserver_.get()));
+        webserver_.get(), resource_broker_.get(), request_pool_service_.get()));
   } else {
     vector<TNetworkAddress> addresses;
     addresses.push_back(MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port));
-    scheduler_.reset(new SimpleScheduler(addresses, metrics_.get(), webserver_.get()));
+    scheduler_.reset(new SimpleScheduler(addresses, metrics_.get(), webserver_.get(),
+        resource_broker_.get(), request_pool_service_.get()));
   }
   if (exec_env_ == NULL) exec_env_ = this;
+  if (FLAGS_enable_rm) resource_broker_->set_scheduler(scheduler_.get());
 }
 
 ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
@@ -114,8 +153,6 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
   : stream_mgr_(new DataStreamMgr()),
     impalad_client_cache_(new ImpalaInternalServiceClientCache()),
     catalogd_client_cache_(new CatalogServiceClientCache()),
-    fs_cache_(new HdfsFsCache()),
-    lib_cache_(new LibCache()),
     htable_factory_(new HBaseTableFactory()),
     disk_io_mgr_(new DiskIoMgr()),
     webserver_(new Webserver(webserver_port)),
@@ -124,9 +161,19 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
     thread_mgr_(new ThreadResourceMgr),
     hdfs_op_thread_pool_(
         CreateHdfsOpThreadPool("hdfs-worker-pool", FLAGS_num_hdfs_worker_threads, 1024)),
+    request_pool_service_(new RequestPoolService()),
     enable_webserver_(FLAGS_enable_webserver && webserver_port > 0),
     tz_database_(TimezoneDatabase()),
     is_fe_tests_(false) {
+  if (FLAGS_enable_rm) {
+    TNetworkAddress llama_address =
+        MakeNetworkAddress(FLAGS_llama_host, FLAGS_llama_port);
+    TNetworkAddress llama_callback_address =
+        MakeNetworkAddress(hostname, FLAGS_llama_callback_port);
+    resource_broker_.reset(new ResourceBroker(llama_address, llama_callback_address,
+        metrics_.get()));
+    cgroups_mgr_.reset(new CgroupsMgr(metrics_.get()));
+  }
   if (FLAGS_use_statestore && statestore_port > 0) {
     TNetworkAddress subscriber_address =
         MakeNetworkAddress(hostname, subscriber_port);
@@ -135,26 +182,42 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
     TNetworkAddress backend_address = MakeNetworkAddress(hostname, backend_port);
 
     statestore_subscriber_.reset(new StatestoreSubscriber(
-        Substitute("impalad@$0", TNetworkAddressToString(backend_address)),
-        subscriber_address, statestore_address, metrics_.get()));
+        TNetworkAddressToString(backend_address), subscriber_address, statestore_address,
+        metrics_.get()));
 
     scheduler_.reset(new SimpleScheduler(statestore_subscriber_.get(),
         statestore_subscriber_->id(), backend_address, metrics_.get(),
-        webserver_.get()));
-
+        webserver_.get(), resource_broker_.get(), request_pool_service_.get()));
   } else {
     vector<TNetworkAddress> addresses;
     addresses.push_back(MakeNetworkAddress(hostname, backend_port));
-    scheduler_.reset(new SimpleScheduler(addresses, metrics_.get(), webserver_.get()));
+    scheduler_.reset(new SimpleScheduler(addresses, metrics_.get(), webserver_.get(),
+        resource_broker_.get(), request_pool_service_.get()));
   }
   if (exec_env_ == NULL) exec_env_ = this;
+  if (FLAGS_enable_rm) resource_broker_->set_scheduler(scheduler_.get());
 }
 
 ExecEnv::~ExecEnv() {
 }
 
+Status ExecEnv::InitForFeTests() {
+  mem_tracker_.reset(new MemTracker(-1, "Process"));
+  is_fe_tests_ = true;
+  return Status::OK;
+}
+
 Status ExecEnv::StartServices() {
   LOG(INFO) << "Starting global services";
+
+  if (FLAGS_enable_rm) {
+    // Initialize the resource broker to make sure the Llama is up and reachable.
+    DCHECK(resource_broker_.get() != NULL);
+    RETURN_IF_ERROR(resource_broker_->Init());
+    DCHECK(cgroups_mgr_.get() != NULL);
+    RETURN_IF_ERROR(
+        cgroups_mgr_->Init(FLAGS_cgroup_hierarchy_path, FLAGS_staging_cgroup));
+  }
 
   // Initialize global memory limit.
   int64_t bytes_limit = 0;

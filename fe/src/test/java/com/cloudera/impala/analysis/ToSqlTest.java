@@ -25,11 +25,18 @@ import com.google.common.base.Preconditions;
 // on producing correct SQL.
 public class ToSqlTest extends AnalyzerTest {
 
+  // Helpers for templated join tests.
+  private final String[] joinConditions_ =
+      new String[] {"USING (id)", "ON (a.id = b.id)"};
+  private final String[] joinTypes_ = new String[] {"INNER JOIN", "LEFT OUTER JOIN",
+      "RIGHT OUTER JOIN", "FULL OUTER JOIN", "LEFT SEMI JOIN"};
+
   private static AnalysisContext.AnalysisResult analyze(String query) {
     try {
       AnalysisContext analysisCtxt =
           new AnalysisContext(catalog_, TestUtils.createQueryContext());
-      AnalysisContext.AnalysisResult analysisResult = analysisCtxt.analyze(query);
+      analysisCtxt.analyze(query);
+      AnalysisContext.AnalysisResult analysisResult = analysisCtxt.getAnalysisResult();
       Preconditions.checkNotNull(analysisResult.getStmt());
       return analysisResult;
     } catch (Exception e) {
@@ -47,6 +54,23 @@ public class ToSqlTest extends AnalyzerTest {
     }
     // Try to parse and analyze the resulting SQL to ensure its validity.
     AnalyzesOk(actual);
+  }
+
+  private void runTestTemplate(String sql, String expectedSql, String[]... testDims) {
+    Object[] testVector = new Object[testDims.length];
+    runTestTemplate(sql, expectedSql, 0, testVector, testDims);
+  }
+
+  private void runTestTemplate(String sql, String expectedSql, int dim,
+      Object[] testVector, String[]... testDims) {
+    if (dim >= testDims.length) {
+      testToSql(String.format(sql, testVector), String.format(expectedSql, testVector));
+      return;
+    }
+    for (String s: testDims[dim]) {
+      testVector[dim] = s;
+      runTestTemplate(sql, expectedSql, dim + 1, testVector, testDims);
+    }
   }
 
  @Test
@@ -71,7 +95,8 @@ public class ToSqlTest extends AnalyzerTest {
  }
 
   /**
-   * Tests quoting of identifiers for view compatibility with Hive.
+   * Tests quoting of identifiers for view compatibility with Hive,
+   * and for proper quoting of Impala keywords in view-definition stmts.
    */
   @Test
   public void TestIdentifierQuoting() {
@@ -84,6 +109,12 @@ public class ToSqlTest extends AnalyzerTest {
 
     // Quoted identifiers that require quoting in both Impala and Hive.
     testToSql("select 1 as `???`, 2.0 as '^^^'", "SELECT 1 `???`, 2.0 `^^^`");
+
+    // Test quoting of identifiers that are Impala keywords.
+    testToSql("select `end`.`alter`, `end`.`table` from " +
+        "(select 1 as `alter`, 2 as `table`) `end`",
+        "SELECT `end`.`alter`, `end`.`table` FROM " +
+        "(SELECT 1 `alter`, 2 `table`) `end`");
 
     // Test quoting of inline view aliases.
     testToSql("select a from (select 1 as a) as _t",
@@ -123,29 +154,42 @@ public class ToSqlTest extends AnalyzerTest {
         "SELECT id FROM functional.alltypes WHERE 5 NOT IN (smallint_col, int_col)");
   }
 
+  // Test the toSql() output of joins in a standalone select block.
+  @Test
+  public void joinTest() {
+    testToSql("select * from functional.alltypes a, functional.alltypes b " +
+        "where a.id = b.id",
+        "SELECT * FROM functional.alltypes a, functional.alltypes b WHERE a.id = b.id");
+    testToSql("select * from functional.alltypes a cross join functional.alltypes b",
+        "SELECT * FROM functional.alltypes a CROSS JOIN functional.alltypes b");
+    runTestTemplate("select * from functional.alltypes a %s functional.alltypes b %s",
+        "SELECT * FROM functional.alltypes a %s functional.alltypes b %s",
+        joinTypes_, joinConditions_);
+  }
+
   // Test the toSql() output of aggregate and group by expressions.
   @Test
   public void aggregationTest() {
     testToSql("select COUNT(*), count(id), COUNT(id), SUM(id), AVG(id) " +
         "from functional.alltypes group by tinyint_col",
-        "SELECT COUNT(*), COUNT(id), COUNT(id), SUM(id), AVG(id) " +
+        "SELECT count(*), count(id), count(id), sum(id), avg(id) " +
         "FROM functional.alltypes GROUP BY tinyint_col");
     testToSql("select avg(float_col / id) from functional.alltypes group by tinyint_col",
-        "SELECT AVG(float_col / id) " +
+        "SELECT avg(float_col / id) " +
         "FROM functional.alltypes GROUP BY tinyint_col");
     testToSql("select avg(double_col) from functional.alltypes " +
         "group by int_col, tinyint_col, bigint_col",
-        "SELECT AVG(double_col) FROM functional.alltypes " +
+        "SELECT avg(double_col) FROM functional.alltypes " +
         "GROUP BY int_col, tinyint_col, bigint_col");
     // Group by with having clause
     testToSql("select avg(id) from functional.alltypes " +
         "group by tinyint_col having count(tinyint_col) > 10",
-        "SELECT AVG(id) FROM functional.alltypes " +
-        "GROUP BY tinyint_col HAVING COUNT(tinyint_col) > 10");
+        "SELECT avg(id) FROM functional.alltypes " +
+        "GROUP BY tinyint_col HAVING count(tinyint_col) > 10");
     testToSql("select sum(id) from functional.alltypes group by tinyint_col " +
         "having avg(tinyint_col) > 10 AND count(tinyint_col) > 5",
-        "SELECT SUM(id) FROM functional.alltypes GROUP BY tinyint_col " +
-        "HAVING AVG(tinyint_col) > 10 AND COUNT(tinyint_col) > 5");
+        "SELECT sum(id) FROM functional.alltypes GROUP BY tinyint_col " +
+        "HAVING avg(tinyint_col) > 10 AND count(tinyint_col) > 5");
   }
 
   // Test the toSql() output of the order by clause.
@@ -198,11 +242,11 @@ public class ToSqlTest extends AnalyzerTest {
         "group by bigint_col, int_col " +
         "having count(int_col) > 10 OR sum(bigint_col) > 20 " +
         "order by 2 DESC NULLS LAST, 3 ASC",
-        "SELECT bigint_col, AVG(double_col), SUM(tinyint_col) " +
+        "SELECT bigint_col, avg(double_col), sum(tinyint_col) " +
         "FROM functional.alltypes " +
         "WHERE double_col > 2.5 AND string_col != 'abc' " +
         "GROUP BY bigint_col, int_col " +
-        "HAVING COUNT(int_col) > 10 OR SUM(bigint_col) > 20 " +
+        "HAVING count(int_col) > 10 OR sum(bigint_col) > 20 " +
         "ORDER BY 2 DESC NULLS LAST, 3 ASC");
   }
 
@@ -278,7 +322,23 @@ public class ToSqlTest extends AnalyzerTest {
    * Tests that toSql() properly handles inline views and their expression substitutions.
    */
   @Test
-  public void subqueryTest() {
+  public void inlineViewTest() {
+    // Test joins in an inline view.
+    testToSql("select t.* from " +
+        "(select a.* from functional.alltypes a, functional.alltypes b " +
+        "where a.id = b.id) t",
+        "SELECT t.* FROM " +
+        "(SELECT a.* FROM functional.alltypes a, functional.alltypes b " +
+        "WHERE a.id = b.id) t");
+    testToSql("select t.* from (select a.* from functional.alltypes a " +
+        "cross join functional.alltypes b) t",
+        "SELECT t.* FROM (SELECT a.* FROM functional.alltypes a " +
+        "CROSS JOIN functional.alltypes b) t");
+    runTestTemplate("select t.* from (select a.* from functional.alltypes a %s " +
+        "functional.alltypes b %s) t",
+        "SELECT t.* FROM (SELECT a.* FROM functional.alltypes a %s " +
+        "functional.alltypes b %s) t", joinTypes_, joinConditions_);
+
     // Test undoing expr substitution in select-list exprs and on clause.
     testToSql("select t1.int_col, t2.int_col from " +
         "(select int_col from functional.alltypes) t1 inner join " +
@@ -291,10 +351,10 @@ public class ToSqlTest extends AnalyzerTest {
         "(select id, string_col from functional.alltypes) t1 inner join " +
         "(select id, float_col from functional.alltypes) t2 on (t1.id = t2.id) " +
         "group by t1.id, t2.id having count(t2.float_col) > 2",
-        "SELECT COUNT(t1.string_col), SUM(t2.float_col) FROM " +
+        "SELECT count(t1.string_col), sum(t2.float_col) FROM " +
         "(SELECT id, string_col FROM functional.alltypes) t1 INNER JOIN " +
         "(SELECT id, float_col FROM functional.alltypes) t2 ON (t1.id = t2.id) " +
-        "GROUP BY t1.id, t2.id HAVING COUNT(t2.float_col) > 2");
+        "GROUP BY t1.id, t2.id HAVING count(t2.float_col) > 2");
     // Test undoing expr substitution in order by clause.
     testToSql("select t1.id, t2.id from " +
         "(select id, string_col from functional.alltypes) t1 inner join " +
@@ -320,16 +380,6 @@ public class ToSqlTest extends AnalyzerTest {
     // WITH clause in select stmt.
     testToSql("with t as (select * from functional.alltypes) select * from t",
         "WITH t AS (SELECT * FROM functional.alltypes) SELECT * FROM t");
-    // WITH clause in select stmt with a join and an ON clause.
-    testToSql("with t as (select * from functional.alltypes) " +
-        "select * from t a inner join t b on (a.int_col = b.int_col)",
-        "WITH t AS (SELECT * FROM functional.alltypes) " +
-        "SELECT * FROM t a INNER JOIN t b ON (a.int_col = b.int_col)");
-    // WITH clause in select stmt with a join and a USING clause.
-    testToSql("with t as (select * from functional.alltypes) " +
-        "select * from t a inner join t b using(int_col)",
-        "WITH t AS (SELECT * FROM functional.alltypes) " +
-        "SELECT * FROM t a INNER JOIN t b USING (int_col)");
     // WITH clause in a union stmt.
     testToSql("with t1 as (select * from functional.alltypes)" +
         "select * from t1 union all select * from t1",
@@ -344,6 +394,19 @@ public class ToSqlTest extends AnalyzerTest {
         "WITH t1 AS (SELECT * FROM functional.alltypes) " +
         "INSERT INTO TABLE functional.alltypes PARTITION (year, month) " +
         "SELECT * FROM t1");
+    // Test joins in WITH-clause view.
+    testToSql("with t as (select a.* from functional.alltypes a, " +
+        "functional.alltypes b where a.id = b.id) select * from t",
+        "WITH t AS (SELECT a.* FROM functional.alltypes a, " +
+        "functional.alltypes b WHERE a.id = b.id) SELECT * FROM t");
+    testToSql("with t as (select a.* from functional.alltypes a " +
+        "cross join functional.alltypes b) select * from t",
+        "WITH t AS (SELECT a.* FROM functional.alltypes a " +
+        "CROSS JOIN functional.alltypes b) SELECT * FROM t");
+    runTestTemplate("with t as (select a.* from functional.alltypes a %s " +
+        "functional.alltypes b %s) select * from t",
+        "WITH t AS (SELECT a.* FROM functional.alltypes a %s " +
+        "functional.alltypes b %s) SELECT * FROM t", joinTypes_, joinConditions_);
     // WITH clause in complex query with joins and and order by + limit.
     testToSql("with t as (select int_col x, bigint_col y from functional.alltypestiny " +
         "order by id nulls first limit 2) " +
@@ -443,9 +506,9 @@ public class ToSqlTest extends AnalyzerTest {
     testToSql("select count(*), (count(*)), avg(int_col), (avg(int_col)), " +
         "sum(int_col), (sum(int_col)), min(int_col), (min(int_col)), " +
         "max(int_col), (max(int_col)) from functional.alltypes",
-        "SELECT COUNT(*), (COUNT(*)), AVG(int_col), (AVG(int_col)), " +
-        "SUM(int_col), (SUM(int_col)), MIN(int_col), (MIN(int_col)), " +
-        "MAX(int_col), (MAX(int_col)) FROM functional.alltypes");
+        "SELECT count(*), (count(*)), avg(int_col), (avg(int_col)), " +
+        "sum(int_col), (sum(int_col)), min(int_col), (min(int_col)), " +
+        "max(int_col), (max(int_col)) FROM functional.alltypes");
     // ArithmeticExpr.
     testToSql("select 1 * 1, (1 * 1), 2 / 2, (2 / 2), 3 % 3, (3 % 3), " +
         "4 DIV 4, (4 DIV 4), 5 + 5, (5 + 5), 6 - 6, (6 - 6), 7 & 7, (7 & 7), " +
@@ -548,5 +611,13 @@ public class ToSqlTest extends AnalyzerTest {
         "(date_sub(timestamp_col, interval 40 hours)) from functional.alltypes",
         "SELECT DATE_SUB(timestamp_col, INTERVAL 40 hours), " +
         "(DATE_SUB(timestamp_col, INTERVAL 40 hours)) FROM functional.alltypes");
+  }
+
+  /**
+   * Tests decimals are output correctly.
+   */
+  @Test
+  public void testDecimal() {
+    testToSql("select cast(1 as decimal)", "SELECT CAST(1 AS DECIMAL(9,0))");
   }
 }

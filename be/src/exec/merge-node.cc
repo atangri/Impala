@@ -80,7 +80,15 @@ Status MergeNode::Prepare(RuntimeState* state) {
 }
 
 Status MergeNode::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
+  RETURN_IF_ERROR(ExecNode::Open(state));
+  // Open const expr lists.
+  for (int i = 0; i < const_result_expr_lists_.size(); ++i) {
+    RETURN_IF_ERROR(Expr::Open(const_result_expr_lists_[i], state));
+  }
+  // Open result expr lists.
+  for (int i = 0; i < result_expr_lists_.size(); ++i) {
+    RETURN_IF_ERROR(Expr::Open(result_expr_lists_[i], state));
+  }
   return Status::OK;
 }
 
@@ -91,9 +99,7 @@ Status MergeNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   // Create new tuple buffer for row_batch.
   int tuple_buffer_size = row_batch->capacity() * tuple_desc_->byte_size();
-  void* tuple_buffer = row_batch->tuple_data_pool()->Allocate(tuple_buffer_size);
-  bzero(tuple_buffer, tuple_buffer_size);
-  Tuple* tuple = reinterpret_cast<Tuple*>(tuple_buffer);
+  Tuple* tuple = Tuple::Create(tuple_buffer_size, row_batch->tuple_data_pool());
 
   // Evaluate and materialize the const expr lists exactly once.
   while (const_result_expr_idx_ < const_result_expr_lists_.size()) {
@@ -102,7 +108,7 @@ Status MergeNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
         &tuple, row_batch);
     ++const_result_expr_idx_;
     *eos = ReachedLimit();
-    if (*eos || row_batch->IsFull()) return Status::OK;
+    if (*eos || row_batch->AtCapacity()) return Status::OK;
   }
   if (child_idx_ == INVALID_CHILD_IDX) child_idx_ = 0;
 
@@ -157,6 +163,12 @@ Status MergeNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
 void MergeNode::Close(RuntimeState* state) {
   if (is_closed()) return;
   child_row_batch_.reset();
+  for (int i = 0; i < const_result_expr_lists_.size(); ++i) {
+    Expr::Close(const_result_expr_lists_[i], state);
+  }
+  for (int i = 0; i < result_expr_lists_.size(); ++i) {
+    Expr::Close(result_expr_lists_[i], state);
+  }
   ExecNode::Close(state);
 }
 
@@ -209,7 +221,7 @@ bool MergeNode::EvalAndMaterializeExprs(const vector<Expr*>& exprs,
       (*tuple)->Init(tuple_desc_->byte_size());
     }
 
-    if (row_batch->IsFull() || row_batch->AtResourceLimit() || ReachedLimit()) {
+    if (row_batch->AtCapacity() || ReachedLimit()) {
       return true;
     }
   } while (!done);

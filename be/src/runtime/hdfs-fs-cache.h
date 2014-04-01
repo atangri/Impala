@@ -17,6 +17,7 @@
 #define IMPALA_RUNTIME_HDFS_FS_CACHE_H
 
 #include <string>
+#include <boost/scoped_ptr.hpp>
 #include <boost/unordered_map.hpp>
 #include <boost/thread/mutex.hpp>
 #include <hdfs.h>
@@ -24,13 +25,21 @@
 namespace impala {
 
 // A (process-wide) cache of hdfsFS objects.
-// These connections are shared across all threads and kept
-// open until the process terminates.
-// (Calls to hdfsDisconnect() by individual threads would terminate all
-// other connections handed out via hdfsConnect() to the same URI.)
+// These connections are shared across all threads and kept open until the process
+// terminates.
+//
+// These connections are leaked, i.e. we never call hdfsDisconnect(). Calls to
+// hdfsDisconnect() by individual threads would terminate all other connections handed
+// out via hdfsConnect() to the same URI, and there is no simple, safe way to call
+// hdfsDisconnect() when process terminates (the proper solution is likely to create a
+// signal handler to detect when the process is killed, but we would still leak when
+// impalad crashes).
 class HdfsFsCache {
  public:
-  ~HdfsFsCache();
+  static HdfsFsCache* instance() { return HdfsFsCache::instance_.get(); }
+
+  // Initializes the cache. Must be called before any other APIs.
+  static void Init();
 
   // Get connection to default fs.
   hdfsFS GetDefaultConnection();
@@ -43,9 +52,16 @@ class HdfsFsCache {
   hdfsFS GetConnection(const std::string& host, int port);
 
  private:
+  // Singleton instance. Instantiated in Init().
+  static boost::scoped_ptr<HdfsFsCache> instance_;
+
   boost::mutex lock_;  // protects fs_map_
   typedef boost::unordered_map<std::pair<std::string, int>, hdfsFS> HdfsFsMap;
   HdfsFsMap fs_map_;
+
+  HdfsFsCache() { };
+  HdfsFsCache(HdfsFsCache const& l); // disable copy ctor
+  HdfsFsCache& operator=(HdfsFsCache const& l); // disable assignment
 };
 
 }

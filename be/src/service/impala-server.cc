@@ -26,9 +26,14 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
 #include <google/malloc_extension.h>
+#include <gutil/strings/substitute.h>
 #include <rapidjson/rapidjson.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
 
 #include "catalog/catalog-server.h"
 #include "catalog/catalog-util.h"
@@ -45,13 +50,15 @@
 #include "service/fragment-exec-state.h"
 #include "service/query-exec-state.h"
 #include "statestore/simple-scheduler.h"
+#include "util/bit-util.h"
+#include "util/cgroups-mgr.h"
 #include "util/container-util.h"
 #include "util/debug-util.h"
+#include "util/error-util.h"
 #include "util/impalad-metrics.h"
 #include "util/network-util.h"
 #include "util/parse-util.h"
 #include "util/string-parser.h"
-#include "util/time.h"
 
 #include "gen-cpp/Types_types.h"
 #include "gen-cpp/ImpalaService.h"
@@ -65,13 +72,9 @@ using namespace boost::algorithm;
 using namespace boost::filesystem;
 using namespace boost::uuids;
 using namespace apache::thrift;
-using namespace apache::thrift::protocol;
-using namespace apache::thrift::transport;
-using namespace apache::thrift::server;
-using namespace apache::thrift::concurrency;
-using namespace apache::hive::service::cli::thrift;
 using namespace beeswax;
 using namespace boost::posix_time;
+using namespace strings;
 
 DECLARE_int32(be_port);
 DECLARE_string(nn);
@@ -91,6 +94,11 @@ DEFINE_string(default_query_options, "", "key=value pair of default query option
 DEFINE_int32(query_log_size, 25, "Number of queries to retain in the query log. If -1, "
                                  "the query log has unbounded size.");
 DEFINE_bool(log_query_to_file, true, "if true, logs completed query profiles to file.");
+
+DEFINE_int64(max_result_cache_size, 100000L, "Maximum number of query results a client "
+    "may request to be cached on a per-query basis to support restarting fetches. This "
+    "option guards against unreasonably large result caches requested by clients. "
+    "Requests exceeding this maximum will be rejected.");
 
 // TODO: this logging should go into a per query log.
 DEFINE_int32(log_mem_usage_interval, 0, "If non-zero, impalad will output memory usage "
@@ -129,6 +137,10 @@ DEFINE_int32(idle_query_timeout, 0, "The time, in seconds, that a query may be i
     " (i.e. no processing work is done and no updates are received from the client) "
     "before it is cancelled. If 0, idle queries are never expired.");
 
+DEFINE_string(local_nodemanager_url, "", "The URL of the local Yarn Node Manager's HTTP "
+    "interface, used to detect if the Node Manager fails");
+DECLARE_bool(enable_rm);
+
 namespace impala {
 
 // Prefix of profile and event log filenames. The version number is
@@ -146,6 +158,8 @@ const char* ImpalaServer::SQLSTATE_SYNTAX_ERROR_OR_ACCESS_VIOLATION = "42000";
 const char* ImpalaServer::SQLSTATE_GENERAL_ERROR = "HY000";
 const char* ImpalaServer::SQLSTATE_OPTIONAL_FEATURE_NOT_IMPLEMENTED = "HYC00";
 const int ImpalaServer::ASCII_PRECISION = 16; // print 16 digits for double/float
+
+const int MAX_NM_MISSED_HEARTBEATS = 5;
 
 // Work item for ImpalaServer::cancellation_thread_pool_.
 class CancellationWork {
@@ -274,6 +288,14 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
     query_expiration_thread_.reset(new Thread("impala-server", "query-expirer",
             bind<void>(&ImpalaServer::ExpireQueries, this)));
   }
+
+  is_offline_ = false;
+  if (FLAGS_enable_rm) {
+    nm_failure_detection_thread_.reset(new Thread("impala-server", "nm-failure-detector",
+            bind<void>(&ImpalaServer::DetectNmFailures, this)));
+  }
+
+  exec_env_->SetImpalaServer(this);
 }
 
 Status ImpalaServer::LogAuditRecord(const ImpalaServer::QueryExecState& exec_state,
@@ -302,13 +324,13 @@ Status ImpalaServer::LogAuditRecord(const ImpalaServer::QueryExecState& exec_sta
   // and "impersonator" field should be Null. Otherwise, the "user" should be set to
   // the current do_as_user() and "impersonator" should be the connected user.
   if (exec_state.do_as_user().empty()) {
-    writer.String(exec_state.user().c_str());
+    writer.String(exec_state.connected_user().c_str());
     writer.String("impersonator");
     writer.Null();
   } else {
     writer.String(exec_state.do_as_user().c_str());
     writer.String("impersonator");
-    writer.String(exec_state.user().c_str());
+    writer.String(exec_state.connected_user().c_str());
   }
   writer.String("statement_type");
   if (request.stmt_type == TStmtType::DDL) {
@@ -323,7 +345,7 @@ Status ImpalaServer::LogAuditRecord(const ImpalaServer::QueryExecState& exec_sta
   }
   writer.String("network_address");
   writer.String(
-      lexical_cast<string>(exec_state.parent_session()->network_address).c_str());
+      lexical_cast<string>(exec_state.session()->network_address).c_str());
   writer.String("sql_statement");
   writer.String(replace_all_copy(exec_state.sql_stmt(), "\n", " ").c_str());
   writer.String("catalog_objects");
@@ -444,18 +466,10 @@ void ImpalaServer::AuditEventLoggerFlushThread() {
 }
 
 void ImpalaServer::ArchiveQuery(const QueryExecState& query) {
-  string encoded_profile_str = query.profile().SerializeToArchiveString();
+  const string& encoded_profile_str = query.profile().SerializeToArchiveString();
 
-  if (VLOG_QUERY_IS_ON) {
-    stringstream ss;
-    ss << "Final profile for query_id=" << query.query_id() << endl
-       << encoded_profile_str;
-    VLOG_QUERY << ss.str();
-  }
-
-  // If there was an error initialising archival (e.g. directory is
-  // not writeable), FLAGS_log_query_to_file will have been set to
-  // false
+  // If there was an error initialising archival (e.g. directory is not writeable),
+  // FLAGS_log_query_to_file will have been set to false
   if (FLAGS_log_query_to_file) {
     int64_t timestamp = time_since_epoch().total_milliseconds();
     stringstream ss;
@@ -507,7 +521,9 @@ Status ImpalaServer::ExecuteInternal(
     bool* registered_exec_state,
     shared_ptr<QueryExecState>* exec_state) {
   DCHECK(session_state != NULL);
-
+  if (IsOffline()) {
+    return Status("This Impala server is offline. Please retry your query later.");
+  }
   *registered_exec_state = false;
 
   exec_state->reset(new QueryExecState(query_ctxt, exec_env_, frontend_.get(),
@@ -558,7 +574,7 @@ Status ImpalaServer::ExecuteInternal(
 
   if ((*exec_state)->coord() != NULL) {
     const unordered_set<TNetworkAddress>& unique_hosts =
-        (*exec_state)->coord()->unique_hosts();
+        (*exec_state)->schedule()->unique_hosts();
     if (!unique_hosts.empty()) {
       lock_guard<mutex> l(query_locations_lock_);
       BOOST_FOREACH(const TNetworkAddress& port, unique_hosts) {
@@ -636,23 +652,22 @@ bool ImpalaServer::UnregisterQuery(const TUniqueId& query_id, const Status* caus
   exec_state->Done();
 
   {
-    lock_guard<mutex> l(exec_state->parent_session()->lock);
-    exec_state->parent_session()->inflight_queries.erase(query_id);
+    lock_guard<mutex> l(exec_state->session()->lock);
+    exec_state->session()->inflight_queries.erase(query_id);
   }
 
   ArchiveQuery(*exec_state);
 
   if (exec_state->coord() != NULL) {
     const unordered_set<TNetworkAddress>& unique_hosts =
-        exec_state->coord()->unique_hosts();
+        exec_state->schedule()->unique_hosts();
     if (!unique_hosts.empty()) {
       lock_guard<mutex> l(query_locations_lock_);
       BOOST_FOREACH(const TNetworkAddress& hostport, unique_hosts) {
-        // Query may have been removed already by cancellation path. In
-        // particular, if node to fail was last sender to an exchange, the
-        // coordinator will realise and fail the query at the same time the
-        // failure detection path does the same thing. They will harmlessly race
-        // to remove the query from this map.
+        // Query may have been removed already by cancellation path. In particular, if
+        // node to fail was last sender to an exchange, the coordinator will realise and
+        // fail the query at the same time the failure detection path does the same
+        // thing. They will harmlessly race to remove the query from this map.
         QueryLocations::iterator it = query_locations_.find(hostport);
         if (it != query_locations_.end()) {
           it->second.erase(exec_state->query_id());
@@ -788,7 +803,7 @@ Status ImpalaServer::GetSessionState(const TUniqueId& session_id,
         stringstream ss;
         ss << "Client session expired due to more than " << FLAGS_idle_session_timeout
            << "s of inactivity (last activity was at: "
-           << i->second->last_accessed.DebugString() << ").";
+           << TimestampValue(i->second->last_accessed_ms / 1000).DebugString() << ").";
         return Status(ss.str());
       }
       if (i->second->closed) return Status("Session is closed");
@@ -926,6 +941,19 @@ Status ImpalaServer::SetQueryOptions(const string& key, const string& value,
       case TImpalaQueryOptions::SYNC_DDL:
         query_options->__set_sync_ddl(iequals(value, "true") || iequals(value, "1"));
         break;
+      case TImpalaQueryOptions::REQUEST_POOL:
+        query_options->__set_request_pool(value);
+        break;
+      case TImpalaQueryOptions::V_CPU_CORES:
+        query_options->__set_v_cpu_cores(atoi(value.c_str()));
+        break;
+      case TImpalaQueryOptions::RESERVATION_REQUEST_TIMEOUT:
+        query_options->__set_reservation_request_timeout(atoi(value.c_str()));
+        break;
+      case TImpalaQueryOptions::DISABLE_CACHED_READS:
+        query_options->__set_disable_cached_reads(
+            iequals(value, "true") || iequals(value, "1"));
+        break;
       default:
         // We hit this DCHECK(false) if we forgot to add the corresponding entry here
         // when we add a new query option.
@@ -966,12 +994,18 @@ void ImpalaServer::ReportExecStatus(
   // every report (assign each query a local int32_t id and use that to index into a
   // vector of QueryExecStates, w/o lookup or locking?)
   shared_ptr<QueryExecState> exec_state = GetQueryExecState(params.query_id, false);
+  // TODO: This is expected occasionally (since a report RPC might be in flight while
+  // cancellation is happening), but repeated instances for the same query are a bug
+  // (which we have occasionally seen). Consider keeping query exec states around for a
+  // little longer (until all reports have been received).
   if (exec_state.get() == NULL) {
     return_val.status.__set_status_code(TStatusCode::INTERNAL_ERROR);
-    stringstream str;
-    str << "unknown query id: " << params.query_id;
-    return_val.status.error_msgs.push_back(str.str());
-    LOG(ERROR) << str.str();
+    const string& err = Substitute("ReportExecStatus(): Received report for unknown "
+        "query ID (probably closed or cancelled). (query_id: $0, backend: $1, instance:"
+        " $2 done: $3)", PrintId(params.query_id), params.backend_num,
+        PrintId(params.fragment_instance_id), params.done);
+    return_val.status.error_msgs.push_back(err);
+    LOG(INFO) << err;
     return;
   }
   exec_state->coord()->UpdateFragmentExecStatus(params).SetTStatus(&return_val);
@@ -1181,6 +1215,18 @@ void ImpalaServer::TQueryOptionsToMap(const TQueryOptions& query_option,
       case TImpalaQueryOptions::SYNC_DDL:
         val << query_option.sync_ddl;
         break;
+      case TImpalaQueryOptions::REQUEST_POOL:
+        val << query_option.request_pool;
+        break;
+      case TImpalaQueryOptions::V_CPU_CORES:
+        val << query_option.v_cpu_cores;
+        break;
+      case TImpalaQueryOptions::RESERVATION_REQUEST_TIMEOUT:
+        val << query_option.reservation_request_timeout;
+        break;
+      case TImpalaQueryOptions::DISABLE_CACHED_READS:
+        val << query_option.disable_cached_reads;
+        break;
       default:
         // We hit this DCHECK(false) if we forgot to add the corresponding entry here
         // when we add a new query option.
@@ -1197,9 +1243,10 @@ void ImpalaServer::SessionState::ToThrift(const TUniqueId& session_id,
   state->session_id = session_id;
   state->session_type = session_type;
   state->database = database;
+  state->connected_user = connected_user;
   // The do_as_user will only be set if impersonation is enabled and the
   // proxy user is authorized to impersonate as this user.
-  state->user = do_as_user.empty() ? user : do_as_user;
+  if (!do_as_user.empty()) state->__set_impersonated_user(do_as_user);
   state->network_address = network_address;
 }
 
@@ -1308,7 +1355,12 @@ void ImpalaServer::CatalogUpdateCallback(
       if (catalog_object.type == TCatalogObjectType::FUNCTION) {
         TCatalogObject dropped_function;
         if (frontend_->GetCatalogObject(catalog_object, &dropped_function).ok()) {
-          dropped_functions.push_back(dropped_function);
+          // This function may have been dropped and re-created. To avoid removing the
+          // re-created function's entry from the cache verify the existing function has a
+          // catalog version <= the catalog version included in this statestore heartbeat.
+          if (dropped_function.catalog_version <= new_catalog_version) {
+            dropped_functions.push_back(dropped_function);
+          }
         }
         // Nothing to do in error case.
       }
@@ -1326,7 +1378,7 @@ void ImpalaServer::CatalogUpdateCallback(
       update.__set_from_version(0L);
       ImpaladMetrics::CATALOG_READY->Update(false);
       // Dropped all cached lib files (this behaves as if all functions are dropped).
-      exec_env_->lib_cache()->DropCache();
+      LibCache::instance()->DropCache();
     } else {
       {
         unique_lock<mutex> unique_lock(catalog_version_lock_);
@@ -1339,7 +1391,7 @@ void ImpalaServer::CatalogUpdateCallback(
       // Remove all dropped functions from the library cache.
       // TODO: is this expensive? We'd like to process heartbeats promptly.
       for (int i = 0; i < dropped_functions.size(); ++i) {
-        exec_env_->lib_cache()->RemoveEntry(dropped_functions[i].fn.hdfs_location);
+        LibCache::instance()->RemoveEntry(dropped_functions[i].fn.hdfs_location);
       }
     }
   }
@@ -1510,7 +1562,7 @@ ImpalaServer::QueryStateRecord::QueryStateRecord(const QueryExecState& exec_stat
 
   stmt = exec_state.sql_stmt();
   stmt_type = request.stmt_type;
-  user = exec_state.user();
+  user = exec_state.connected_user();
   default_db = exec_state.default_db();
   start_time = exec_state.start_time();
   end_time = exec_state.end_time();
@@ -1553,13 +1605,13 @@ void ImpalaServer::ConnectionStart(
     session_state.reset(new SessionState);
     session_state->closed = false;
     session_state->start_time = TimestampValue::local_time();
-    session_state->last_accessed = session_state->start_time;
+    session_state->last_accessed_ms = ms_since_epoch();
     session_state->database = "default";
     session_state->session_type = TSessionType::BEESWAX;
     session_state->network_address = connection_context.network_address;
     // If the username was set by a lower-level transport, use it.
     if (!connection_context.username.empty()) {
-      session_state->user = connection_context.username;
+      session_state->connected_user = connection_context.username;
     }
 
     {
@@ -1616,11 +1668,11 @@ void ImpalaServer::ExpireSessions() {
         // A session closed by other means is in the process of being removed, and it's
         // best not to interfere.
         if (session_state.second->closed || session_state.second->expired) continue;
-        int64_t last_accessed = session_state.second->last_accessed;
-        if (now - last_accessed <= FLAGS_idle_session_timeout) continue;
+        int64_t last_accessed_ms = session_state.second->last_accessed_ms;
+        if (now - last_accessed_ms <= (FLAGS_idle_session_timeout * 1000)) continue;
         LOG(INFO) << "Expiring session: " << session_state.first << ", user:"
-                  << session_state.second->user << ", last active: "
-                  << session_state.second->last_accessed.DebugString();
+                  << session_state.second->connected_user << ", last active: "
+                  << TimestampValue(last_accessed_ms / 1000).DebugString();
         session_state.second->expired = true;
         ImpaladMetrics::NUM_SESSIONS_EXPIRED->Increment(1L);
       }
@@ -1797,6 +1849,81 @@ shared_ptr<ImpalaServer::QueryExecState> ImpalaServer::GetQueryExecState(
     if (lock) i->second->lock()->lock();
     return i->second;
   }
+}
+
+void ImpalaServer::SetOffline(bool is_offline) {
+  lock_guard<mutex> l(is_offline_lock_);
+  is_offline_ = is_offline;
+  ImpaladMetrics::IMPALA_SERVER_READY->Update(is_offline);
+}
+
+void ImpalaServer::DetectNmFailures() {
+  DCHECK(FLAGS_enable_rm);
+  if (FLAGS_local_nodemanager_url.empty()) {
+    LOG(WARNING) << "No NM address set (--nm_addr is empty), no NM failure detection "
+                 << "thread started";
+    return;
+  }
+  // We only want a network address to open a socket to, for now. Get rid of http(s)://
+  // prefix, and split the string into hostname:port.
+  if (istarts_with(FLAGS_local_nodemanager_url, "http://")) {
+    FLAGS_local_nodemanager_url =
+        FLAGS_local_nodemanager_url.substr(string("http://").size());
+  } else if (istarts_with(FLAGS_local_nodemanager_url, "https://")) {
+    FLAGS_local_nodemanager_url =
+        FLAGS_local_nodemanager_url.substr(string("https://").size());
+  }
+  vector<string> components;
+  split(components, FLAGS_local_nodemanager_url, is_any_of(":"));
+  if (components.size() < 2) {
+    LOG(ERROR) << "Could not parse network address from --local_nodemanager_url, no NM"
+               << " failure detection thread started";
+    return;
+  }
+  DCHECK_GE(components.size(), 2);
+  TNetworkAddress nm_addr =
+      MakeNetworkAddress(components[0], atoi(components[1].c_str()));
+
+  MissedHeartbeatFailureDetector failure_detector(MAX_NM_MISSED_HEARTBEATS,
+      MAX_NM_MISSED_HEARTBEATS / 2);
+  struct addrinfo* addr;
+  if (getaddrinfo(nm_addr.hostname.c_str(), components[1].c_str(), NULL, &addr)) {
+    LOG(WARNING) << "Could not resolve NM address: " << nm_addr << ". Error was: "
+                 << GetStrErrMsg();
+    return;
+  }
+  LOG(INFO) << "Starting NM failure-detection thread, NM at: " << nm_addr;
+  // True if the last time through the loop Impala had failed, otherwise false. Used to
+  // only change the offline status when there's a change in state.
+  bool last_failure_state = false;
+  while (true) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd >= 0) {
+      if (connect(sockfd, addr->ai_addr, sizeof(sockaddr)) < 0) {
+        failure_detector.UpdateHeartbeat(FLAGS_local_nodemanager_url, false);
+      } else {
+        failure_detector.UpdateHeartbeat(FLAGS_local_nodemanager_url, true);
+      }
+      ::close(sockfd);
+    } else {
+      LOG(ERROR) << "Could not create socket! Error was: " << GetStrErrMsg();
+    }
+    bool is_failed = (failure_detector.GetPeerState(FLAGS_local_nodemanager_url) ==
+        FailureDetector::FAILED);
+    if (is_failed != last_failure_state) {
+      if (is_failed) {
+        LOG(WARNING) <<
+            "ImpalaServer is going offline while local node-manager connectivity is bad";
+      } else {
+        LOG(WARNING) <<
+            "Node-manager connectivity has been restored. ImpalaServer is now online";
+      }
+      SetOffline(is_failed);
+    }
+    last_failure_state = is_failed;
+    SleepForMs(2000);
+  }
+  freeaddrinfo(addr);
 }
 
 }

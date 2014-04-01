@@ -232,20 +232,17 @@ public abstract class TableRef implements ParseNode {
 
     // at this point, both 'this' and leftTblRef have been analyzed
     // and registered;
-    // we register both our logical tid as well as the materialized tids
-    // as being outer-joined
+    // we register the tuple ids of the TableRefs on the nullable side of an outer join
     boolean lhsIsNullable = false;
     boolean rhsIsNullable = false;
     if (joinOp_ == JoinOperator.LEFT_OUTER_JOIN
         || joinOp_ == JoinOperator.FULL_OUTER_JOIN) {
       analyzer.registerOuterJoinedTids(getId().asList(), this);
-      analyzer.registerOuterJoinedTids(getMaterializedTupleIds(), this);
       rhsIsNullable = true;
     }
     if (joinOp_ == JoinOperator.RIGHT_OUTER_JOIN
         || joinOp_ == JoinOperator.FULL_OUTER_JOIN) {
       analyzer.registerOuterJoinedTids(leftTblRef_.getAllTupleIds(), this);
-      analyzer.registerOuterJoinedTids(leftTblRef_.getAllMaterializedTupleIds(), this);
       lhsIsNullable = true;
     }
 
@@ -316,11 +313,11 @@ public abstract class TableRef implements ParseNode {
     }
 
     StringBuilder output = new StringBuilder(" " + joinOpToSql() + " ");
-    output.append(tableRefToSql()).append(" ");
+    output.append(tableRefToSql());
     if (usingColNames_ != null) {
-      output.append("USING (").append(Joiner.on(", ").join(usingColNames_)).append(")");
+      output.append(" USING (").append(Joiner.on(", ").join(usingColNames_)).append(")");
     } else if (onClause_ != null) {
-      output.append("ON ").append(onClause_.toSql());
+      output.append(" ON ").append(onClause_.toSql());
     }
     return output.toString();
   }

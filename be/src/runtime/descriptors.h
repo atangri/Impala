@@ -73,7 +73,7 @@ std::ostream& operator<<(std::ostream& os, const NullIndicatorOffset& null_indic
 class SlotDescriptor {
  public:
   SlotId id() const { return id_; }
-  PrimitiveType type() const { return type_; }
+  ColumnType type() const { return type_; }
   TupleId parent() const { return parent_; }
   // Returns the column index of this slot, including partition keys.
   // (e.g., col_pos - num_partition_keys = the table column this slot corresponds to)
@@ -102,7 +102,7 @@ class SlotDescriptor {
   friend class TupleDescriptor;
 
   const SlotId id_;
-  const PrimitiveType type_;
+  const ColumnType type_;
   const TupleId parent_;
   const int col_pos_;
   const int tuple_offset_;
@@ -164,9 +164,12 @@ class HdfsPartitionDescriptor {
   THdfsFileFormat::type file_format() const { return file_format_; }
   const std::vector<Expr*>& partition_key_values() const { return partition_key_values_; }
   int block_size() const { return block_size_; }
+  const std::string& location() const { return location_; }
   THdfsCompression::type compression() const { return compression_; }
 
-  // Calls 'Prepare' on all partition key exprs. Calls after the first are no-ops
+  // Calls Prepare() on all partition key exprs. Calls after the first are no-ops.
+  // Note that because these exprs are always literals, they do not need to be opened or
+  // closed.
   Status PrepareExprs(RuntimeState* state);
 
   std::string DebugString() const;
@@ -177,6 +180,7 @@ class HdfsPartitionDescriptor {
   char collection_delim_;
   char escape_char_;
   int block_size_;
+  std::string location_;
   THdfsCompression::type compression_;
 
   // True if PrepareExprs has been called, to prevent repeating expensive codegen

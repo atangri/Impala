@@ -16,6 +16,7 @@ package com.cloudera.impala.planner;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,17 +25,17 @@ import com.cloudera.impala.analysis.AggregateInfo;
 import com.cloudera.impala.analysis.Analyzer;
 import com.cloudera.impala.analysis.Expr;
 import com.cloudera.impala.analysis.FunctionCallExpr;
-import com.cloudera.impala.analysis.SlotDescriptor;
-import com.cloudera.impala.common.Pair;
-import com.cloudera.impala.thrift.TAggregateFunctionCall;
+import com.cloudera.impala.analysis.SlotId;
 import com.cloudera.impala.thrift.TAggregationNode;
 import com.cloudera.impala.thrift.TExplainLevel;
+import com.cloudera.impala.thrift.TExpr;
 import com.cloudera.impala.thrift.TPlanNode;
 import com.cloudera.impala.thrift.TPlanNodeType;
 import com.cloudera.impala.thrift.TQueryOptions;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 /**
  * Aggregation computation.
@@ -63,7 +64,17 @@ public class AggregationNode extends PlanNode {
     super(id, aggInfo.getAggTupleId().asList(), "AGGREGATE");
     aggInfo_ = aggInfo;
     children_.add(input);
+    nullableTupleIds_.addAll(input.getNullableTupleIds());
     needsFinalize_ = true;
+  }
+
+  /**
+   * Copy c'tor used in clone().
+   */
+  private AggregationNode(PlanNodeId id, AggregationNode src) {
+    super(id, src, "AGGREGATE");
+    aggInfo_ = src.aggInfo_;
+    needsFinalize_ = src.needsFinalize_;
   }
 
   public AggregateInfo getAggInfo() { return aggInfo_; }
@@ -83,23 +94,35 @@ public class AggregationNode extends PlanNode {
 
   @Override
   public void init(Analyzer analyzer) {
-    // loop over all materialized slots and add binding predicates to conjuncts_
-    // TODO: unify this with HdfsScanNode; also, we should be able to apply this
-    // logic to predicates over multiple slots
-    for (SlotDescriptor slotDesc: analyzer.getTupleDesc(tupleIds_.get(0)).getSlots()) {
-      ArrayList<Pair<Expr, Boolean>> bindingPredicates =
-          analyzer.getBoundPredicates(slotDesc.getId(), this);
-      for (Pair<Expr, Boolean> p: bindingPredicates) {
-        if (!analyzer.isConjunctAssigned(p.first)) {
-          conjuncts_.add(p.first);
-          if (p.second) analyzer.markConjunctAssigned(p.first);
-        }
+    // TODO: It seems wrong that the 2nd phase agg has aggInfo_.isMerge() == true.
+    // The reason for this is that the non-distinct aggregate functions need to use
+    // the merge function in the BE (see toThrift() of this class). Clean this up.
+    boolean isSecondPhaseAgg = false;
+    if (getChild(0) instanceof AggregationNode) {
+      AggregationNode childAggNode = (AggregationNode) getChild(0);
+      if (childAggNode.getAggInfo().getSecondPhaseDistinctAggInfo() == aggInfo_) {
+        isSecondPhaseAgg = true;
       }
     }
+    // Assign predicates to the top-most agg in the single-node plan that can evaluate
+    // them, as follows: For non-distinct aggs place them in the 1st phase agg node. For
+    // distinct aggs place them in the 2nd phase agg node. The conjuncts are
+    // transferred to the proper place in the multi-node plan via transferConjuncts().
+    if (tupleIds_.get(0).equals(aggInfo_.getOutputTupleId()) &&
+        (isSecondPhaseAgg || !aggInfo_.isMerge())) {
+      // Ignore predicates bound to a group-by slot because those
+      // are already evaluated below this agg node (e.g., in a scan).
+      Set<SlotId> groupBySlots = Sets.newHashSet();
+      for (int i = 0; i < aggInfo_.getGroupingExprs().size(); ++i) {
+        groupBySlots.add(aggInfo_.getAggTupleDesc().getSlots().get(i).getId());
+      }
+      ArrayList<Expr> bindingPredicates =
+          analyzer.getBoundPredicates(tupleIds_.get(0), groupBySlots);
+      conjuncts_.addAll(bindingPredicates);
 
-    // also add remaining unassigned conjuncts_
-    assignConjuncts(analyzer);
-    markSlotsMaterialized(analyzer, conjuncts_);
+      // also add remaining unassigned conjuncts_
+      assignConjuncts(analyzer);
+    }
     computeMemLayout(analyzer);
     // do this at the end so it can take all conjuncts into account
     computeStats(analyzer);
@@ -110,6 +133,8 @@ public class AggregationNode extends PlanNode {
     Expr.SubstitutionMap combinedChildSmap = getCombinedChildSmap();
     aggInfo_.substitute(combinedChildSmap);
     baseTblSmap_ = aggInfo_.getSMap();
+    // assert consistent aggregate expr and slot materialization
+    aggInfo_.checkConsistency();
   }
 
   @Override
@@ -159,11 +184,12 @@ public class AggregationNode extends PlanNode {
   protected void toThrift(TPlanNode msg) {
     msg.node_type = TPlanNodeType.AGGREGATION_NODE;
 
-    List<TAggregateFunctionCall> aggregateFunctions = Lists.newArrayList();
+    List<TExpr> aggregateFunctions = Lists.newArrayList();
     // only serialize agg exprs that are being materialized
     for (FunctionCallExpr e: aggInfo_.getMaterializedAggregateExprs()) {
-      aggregateFunctions.add(e.toTAggregateFunctionCall());
+      aggregateFunctions.add(e.treeToThrift());
     }
+    aggInfo_.checkConsistency();
     msg.agg_node = new TAggregationNode(
         aggregateFunctions,
         aggInfo_.getAggTupleId().asInt(), needsFinalize_);
@@ -240,4 +266,7 @@ public class AggregationNode extends PlanNode {
     perHostMemCost_ += Math.max(perHostCardinality * avgRowSize_ *
         Planner.HASH_TBL_SPACE_OVERHEAD, MIN_HASH_TBL_MEM);
   }
+
+  @Override
+  public AggregationNode clone(PlanNodeId id) { return new AggregationNode(id, this); }
 }

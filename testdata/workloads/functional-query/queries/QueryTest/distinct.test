@@ -284,3 +284,46 @@ bigint, bigint
 ---- RESULTS
 2,2
 ====
+---- QUERY
+# Test distinct + non-distinct aggregates without group by and having clause (IMPALA-845)
+# alltypessmall has 100 non-null values for bigint_col, expect a single result
+select count(distinct tinyint_col) from functional.alltypessmall
+having count(bigint_col) > 99
+---- TYPES
+bigint
+---- RESULTS
+10
+====
+---- QUERY
+# Test distinct + non-distinct aggregates without group by and having clause (IMPALA-845)
+# alltypessmall has 100 non-null values for bigint_col, expect an empty result
+select count(distinct tinyint_col) from functional.alltypessmall
+having count(bigint_col) > 100
+---- TYPES
+bigint
+---- RESULTS
+====
+---- QUERY
+# Regression test for COUNT(ALL ) with no group-by and other distinct agg. IMPALA-862
+select count(*), COUNT(distinct 1) from alltypesagg where false
+---- RESULTS
+0,0
+---- TYPES
+bigint, bigint
+====
+---- QUERY
+# Regression test for COUNT(ALL ) with no group-by and other distinct agg. IMPALA-862
+select count(tinyint_col), sum(distinct int_col) from alltypesagg
+---- RESULTS
+9000,499500
+---- TYPES
+bigint, bigint
+====
+---- QUERY
+# Regression test for COUNT(ALL ) with no group-by and other distinct agg. IMPALA-862
+select count(*), COUNT(distinct 1) from alltypesagg
+---- RESULTS
+10000,1
+---- TYPES
+bigint, bigint
+====

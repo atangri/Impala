@@ -47,6 +47,7 @@ class AuthProvider {
   // an auth protocol requires.
   virtual Status WrapClientTransport(const std::string& hostname,
       boost::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
+      const std::string& service_name,
       boost::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport) = 0;
 
   // Returns true if this provider uses SASL at the transport layer.
@@ -67,6 +68,7 @@ class KerberosAuthProvider : public AuthProvider {
 
   virtual Status WrapClientTransport(const std::string& hostname,
       boost::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
+      const std::string& service_name,
       boost::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport);
 
   virtual Status GetServerTransportFactory(
@@ -101,7 +103,11 @@ class KerberosAuthProvider : public AuthProvider {
   // True if tickets for this principal should be obtained.
   bool needs_kinit_;
 
-  // Runs kinit periodically to maintain a live ticket for principal_.
+  // Periodically (roughly once every FLAGS_kerberor_reinit_interval minutes) calls kinit
+  // to get a ticket granting ticket from the kerberos server for principal_, which is
+  // kept in the kerberos cache associated with this process. Once the first attempt to
+  // obtain a ticket has completed, first_kinit is Set() with the status of the
+  // operation. Additionally, if the first attempt fails, this method will return.
   void RunKinit(Promise<Status>* first_kinit);
 };
 
@@ -120,6 +126,7 @@ class LdapAuthProvider : public AuthProvider {
       boost::shared_ptr<apache::thrift::transport::TTransportFactory>* factory);
   virtual Status WrapClientTransport(const std::string& hostname,
       boost::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
+      const std::string& service_name,
       boost::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport);
 
   virtual bool is_sasl() { return true; }
@@ -143,6 +150,7 @@ class NoAuthProvider : public AuthProvider {
 
   virtual Status WrapClientTransport(const std::string& hostname,
       boost::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
+      const std::string& service_name,
       boost::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport);
 
   virtual bool is_sasl() { return false; }

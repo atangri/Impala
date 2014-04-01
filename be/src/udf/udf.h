@@ -40,13 +40,14 @@ struct BigIntVal;
 struct StringVal;
 struct TimestampVal;
 
-// The FunctionContext is passed to every UDF/UDA and is the interface for the UDF to the
-// rest of the system. It contains APIs to examine the system state, report errors
-// and manage memory.
+// A FunctionContext is passed to every UDF/UDA and is the interface for the UDF to the
+// rest of the system. It contains APIs to examine the system state, report errors and
+// manage memory.
 class FunctionContext {
  public:
   enum ImpalaVersion {
     v1_2,
+    v1_3,
   };
 
   enum Type {
@@ -64,9 +65,39 @@ class FunctionContext {
     TYPE_FIXED_BUFFER,
   };
 
+  struct TypeDesc {
+    Type type;
+
+    // Only valid if type == TYPE_DECIMAL
+    int precision;
+    int scale;
+  };
+
   struct UniqueId {
     int64_t hi;
     int64_t lo;
+  };
+
+  enum FunctionStateScope {
+    // Indicates that the function state for this FunctionContext's UDF is shared across
+    // the plan fragment (a query is divided into multiple plan fragments, each of which
+    // is responsible for a part of the query execution). Within the plan fragment, there
+    // may be multiple instances of the UDF executing concurrently with multiple
+    // FunctionContexts sharing this state, meaning that the state must be
+    // thread-safe. The Prepare() function for the UDF may be called with this scope
+    // concurrently on a single host if the UDF will be evaluated in multiple plan
+    // fragments on that host. In general, read-only state that doesn't need to be
+    // recomputed for every UDF call should be fragment-local.
+    // TODO: not yet implemented
+    FRAGMENT_LOCAL,
+
+    // Indicates that the function state is local to the execution thread. This state
+    // does not need to be thread-safe. However, this state will be initialized (via the
+    // Prepare() function) once for every execution thread, so fragment-local state
+    // should be used when possible for better performance. In general, inexpensive
+    // shared state that is written to by the UDF (e.g. scratch space) should be
+    // thread-local.
+    THREAD_LOCAL,
   };
 
   // Returns the version of Impala that's currently running.
@@ -95,11 +126,10 @@ class FunctionContext {
   // Returns the current error message. Returns NULL if there is no error.
   const char* error_msg() const;
 
-  // Allocates memory for UDAs. All UDA allocations should use this if possible instead of
-  // malloc/new. The UDA is responsible for calling Free() on all buffers returned
-  // by Allocate().
-  // If this Allocate causes the memory limit to be exceeded, the error will be set
-  // in this object causing the query to fail.
+  // Allocates memory. All UDF/UDAs should use this if possible instead of
+  // malloc/new. The UDF/UDA is responsible for calling Free() on all buffers returned by
+  // Allocate(). If this Allocate causes the memory limit to be exceeded, the error will
+  // be set in this object causing the query to fail.
   uint8_t* Allocate(int byte_size);
 
   // Reallocates 'ptr' to the new byte_size. If the currently underlying allocation
@@ -119,6 +149,28 @@ class FunctionContext {
   void TrackAllocation(int64_t byte_size);
   void Free(int64_t byte_size);
 
+  // Methods for maintaining state across UDF/UDA function calls. SetFunctionState() can
+  // be used to store a pointer that can then be retreived via GetFunctionState(). If
+  // GetFunctionState() is called when no pointer is set, it will return
+  // NULL. SetFunctionState() does not take ownership of 'ptr'; it is up to the UDF/UDA
+  // to clean up any function state if necessary.
+  void SetFunctionState(FunctionStateScope scope, void* ptr);
+  void* GetFunctionState(FunctionStateScope scope) const;
+
+  // Returns the type information for the arg_idx-th argument (0-indexed, not including
+  // the FunctionContext* argument). Returns NULL if arg_idx is invalid.
+  const TypeDesc* GetArgType(int arg_idx) const;
+
+  // Returns true if the arg_idx-th input argument (0 indexed, not including the
+  // FunctionContext* argument) is a constant (e.g. 5, "string", 1 + 1).
+  bool IsArgConstant(int arg_idx) const;
+
+  // Returns a pointer to the value of the arg_idx-th input argument (0 indexed, not
+  // including the FunctionContext* argument). Returns NULL if the argument is not
+  // constant. This function can be used to obtain user-specified constants in a UDF's
+  // Init() or Close() functions.
+  AnyVal* GetConstantArg(int arg_idx) const;
+
   // TODO: Do we need to add arbitrary key/value metadata. This would be plumbed
   // through the query. E.g. "select UDA(col, 'sample=true') from tbl".
   // const char* GetMetadata(const char*) const;
@@ -130,10 +182,6 @@ class FunctionContext {
   // Returns the underlying opaque implementation object. The UDF/UDA should not
   // use this. This is used internally.
   impala::FunctionContextImpl* impl() { return impl_; }
-
-  // Create a test FunctionContext object. The caller is responsible for calling delete
-  // on it. This context has additional debugging validation enabled.
-  static FunctionContext* CreateTestContext();
 
   ~FunctionContext();
 
@@ -151,13 +199,12 @@ class FunctionContext {
 //----------------------------------------------------------------------------
 //------------------------------- UDFs ---------------------------------------
 //----------------------------------------------------------------------------
-// The UDF function must implement this function prototype. This is not
-// a typedef as the actual UDF's signature varies from UDF to UDF.
+// The UDF must implement this function prototype. This is not a typedef as the actual
+// UDF's signature varies from UDF to UDF.
 //    typedef <*Val> Evaluate(FunctionContext* context, <const Val& arg>);
 //
-// The UDF must return one of the *Val structs. The UDF must accept a pointer
-// to a FunctionContext object and then a const reference for each of the input arguments.
-// NULL input arguments will have NULL passed in.
+// The UDF must return one of the *Val structs. The UDF must accept a pointer to a
+// FunctionContext object and then a const reference for each of the input arguments.
 // Examples of valid Udf signatures are:
 //  1) DoubleVal Example1(FunctionContext* context);
 //  2) IntVal Example2(FunctionContext* context, const IntVal& a1, const DoubleVal& a2);
@@ -169,32 +216,69 @@ class FunctionContext {
 // In this case args[0] is the first variable argument and args[num_var_args - 1] is
 // the last.
 //
-// The UDF should not maintain any state across calls since there is no guarantee
-// on how the execution is multithreaded or distributed. Conceptually, the UDF
-// should only read the input arguments and return the result, using only the
-// FunctionContext as an external object.
+// ------- Memory Management -------
+// ---------------------------------
+// The UDF can assume that memory from input arguments will have the same lifetime as
+// results for the UDF. In other words, the UDF can return memory from input arguments
+// without making copies. For example, a function like substring will not need to
+// allocate and copy the smaller string.
 //
-// Memory Managment: the UDF can assume that memory from input arguments will have
-// the same lifetime as results for the UDF. In other words, the UDF can return
-// memory from input arguments without making copies. For example, a function like
-// substring will not need to allocate and copy the smaller string. For cases where
-// the UDF needs a buffer, it should use the StringValue(FunctionContext, len) c'tor.
+// Any state needed across calls must be stored and accessed via
+// FunctionContext::SetFunctionState() and FunctionContext::GetFunctionState(). The UDF
+// should not maintain any other state across calls since there is no guarantee on how
+// the execution is multithreaded or distributed.
 //
-// The UDF can optionally specify a Prepare function. The prepare function is called
-// once before any calls to the Udf to evaluate values. This is the appropriate time for
-// the Udf to validate versions and things like that.
-// If there is an error, this function should call FunctionContext::SetError()/
+// -------- Execution Model --------
+// ---------------------------------
+// Execution model: For each UDF use occurring in a given query, at least one
+// FunctionContext will be created. For a given FunctionContext, the UDF's functions are
+// never called concurrently and therefore do not need to be thread-safe. State shared
+// across UDF invocations should be initialized and cleaned up using prepare and close
+// functions (described below).
+//
+// Note that a single UDF use may produce multiple FunctionContexts for that UDF (this is
+// so the UDF can be executed concurrently in different threads). For example, the query
+// "select * from tbl where my_udf(x) > 0" may produce multiple FunctionContexts for
+// 'my_udf', each of which may concurrently be passed to 'my_udf's prepare, close, and
+// UDF functions.
+//
+// --- Prepare / Close Functions ---
+// ---------------------------------
+// The UDF can optionally include a prepare function, specified in the "CREATE FUNCTION"
+// statement using "prepare_fn=<prepare function symbol>". The prepare function is called
+// before any calls to the UDF to evaluate values. This is the appropriate time for the
+// UDF to initialize any shared data structures, validate versions, etc. If there is an
+// error, this function should call FunctionContext::SetError()/
 // FunctionContext::AddWarning().
-typedef void (*UdfPrepareFn)(FunctionContext* context);
+//
+// The prepare function is called multiple times with different FunctionStateScopes. It
+// will be called once per fragment with 'scope' set to FRAGMENT_LOCAL, and once per
+// execution thread with 'scope' set to THREAD_LOCAL.
+typedef void (*UdfPrepare)(FunctionContext* context,
+                           FunctionContext::FunctionStateScope scope);
+
+// The UDF can also optionally include a close function, specified in the "CREATE
+// FUNCTION" statement using "close_fn=<close function symbol>". The close function is
+// called after all calls to the UDF have completed. This is the appropriate time for the
+// UDF to deallocate any shared data structures that are not needed to maintain the
+// results. If there is an error, this function should call FunctionContext::SetError()/
+// FunctionContext::AddWarning().
+//
+// The close function is called multiple times with different FunctionStateScopes. It
+// will be called once per fragment with 'scope' set to FRAGMENT_LOCAL, and once per
+// execution thread with 'scope' set to THREAD_LOCAL.
+typedef void (*UdfClose)(FunctionContext* context,
+                         FunctionContext::FunctionStateScope scope);
 
 //----------------------------------------------------------------------------
 //------------------------------- UDAs ---------------------------------------
 //----------------------------------------------------------------------------
 // The UDA execution is broken up into a few steps. The general calling pattern
 // is one of these:
-//  1) Init(), Evaluate() (repeatedly), Serialize()
-//  2) Init(), Merge() (repeatedly), Serialize()
-//  3) Init(), Finalize()
+//  1) Init(), Update() (repeatedly), Serialize()
+//  2) Init(), Update() (repeatedly), Finalize()
+//  3) Init(), Merge() (repeatedly), Serialize()
+//  4) Init(), Merge() (repeatedly), Finalize()
 // The UDA is registered with three types: the result type, the input type and
 // the intermediate type.
 //
@@ -206,11 +290,13 @@ typedef void (*UdfPrepareFn)(FunctionContext* context);
 // intermediate type should be string and the UDA can cast the ptr to the structure
 // it is using.
 //
-// Memory Management: For allocations that are not returned to Impala, the UDA
-// should use the FunctionContext::Allocate()/Free() methods. For StringVal allocations
-// returned to Impala (e.g. UdaSerialize()), the UDA should allocate the result
-// via StringVal(FunctionContext*, int) ctor and Impala will automatically handle
-// freeing it.
+// Memory Management: For allocations that are not returned to Impala, the UDA should use
+// the FunctionContext::Allocate()/Free() methods. In general, Allocate() is called in
+// Init(), and then Free() must be called in both Serialize() and Finalize(), since
+// either of these functions may be called to clean up the state. For StringVal
+// allocations returned to Impala (e.g. returned by UdaSerialize()), the UDA should
+// allocate the result via StringVal(FunctionContext*, int) ctor and Impala will
+// automatically handle freeing it.
 //
 // For clarity in documenting the UDA interface, the various types will be typedefed
 // here. The actual execution resolves all the types at runtime and none of these types
@@ -237,7 +323,7 @@ typedef void (*UdaMerge)(FunctionContext* context, const IntermediateType& src,
     IntermediateType* dst);
 
 // Serialize the intermediate type. The serialized data is then sent across the
-// wire. This is not called unless the intermediate type is String.
+// wire.
 // No additional functions will be called with this FunctionContext object and the
 // UDA should do final clean (e.g. Free()) here.
 typedef const IntermediateType (*UdaSerialize)(FunctionContext* context,

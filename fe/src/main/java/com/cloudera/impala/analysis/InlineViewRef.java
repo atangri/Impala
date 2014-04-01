@@ -27,8 +27,10 @@ import com.cloudera.impala.catalog.ColumnStats;
 import com.cloudera.impala.catalog.InlineView;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.InternalException;
+import com.cloudera.impala.common.TreeNode;
 import com.cloudera.impala.service.FeSupport;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
 
 
@@ -95,6 +97,7 @@ public class InlineViewRef extends TableRef {
     inlineViewAnalyzer_ = new Analyzer(analyzer, user);
     inlineViewAnalyzer_.setUseHiveColLabels(useHiveColLabels);
     queryStmt_.analyze(inlineViewAnalyzer_);
+
     inlineViewAnalyzer_.setHasLimit(queryStmt_.hasLimitClause());
     queryStmt_.getMaterializedTupleIds(materializedTupleIds_);
     desc_ = analyzer.registerInlineViewRef(this);
@@ -111,8 +114,8 @@ public class InlineViewRef extends TableRef {
     // create smap_ and baseTblSmap_ and register auxiliary eq predicates between our
     // tuple descriptor's slots and our *unresolved* select list exprs;
     // we create these auxiliary predicates so that the analyzer can compute the value
-    // transfer graph through this inline view correctly (ie, predicates can get propagated
-    // through the view)
+    // transfer graph through this inline view correctly (ie, predicates can get
+    // propagated through the view)
     for (int i = 0; i < queryStmt_.getColLabels().size(); ++i) {
       String colName = queryStmt_.getColLabels().get(i);
       Expr colExpr = queryStmt_.getResultExprs().get(i);
@@ -186,7 +189,7 @@ public class InlineViewRef extends TableRef {
       throws AnalysisException, InternalException, AuthorizationException {
     // Gather all unique rhs SlotRefs into rhsSlotRefs
     List<SlotRef> rhsSlotRefs = Lists.newArrayList();
-    Expr.collectList(smap.getRhs(), SlotRef.class, rhsSlotRefs);
+    TreeNode.collect(smap.getRhs(), Predicates.instanceOf(SlotRef.class), rhsSlotRefs);
     // Map for substituting SlotRefs with NullLiterals.
     Expr.SubstitutionMap nullSMap = new Expr.SubstitutionMap();
     for (SlotRef rhsSlotRef: rhsSlotRefs) {
@@ -216,7 +219,7 @@ public class InlineViewRef extends TableRef {
     // If the expr is already wrapped in an IF(TupleIsNull(), NULL, expr)
     // then do not try to execute it.
     // TODO: return true in this case?
-    if (expr.contains(TupleIsNullPredicate.class)) return true;
+    if (expr.contains(Predicates.instanceOf(TupleIsNullPredicate.class))) return true;
 
     // Replace all SlotRefs in expr with NullLiterals, and wrap the result
     // with an IS NOT NULL predicate.
@@ -267,7 +270,7 @@ public class InlineViewRef extends TableRef {
   protected String tableRefToSql() {
     // Enclose the alias in quotes if Hive cannot parse it without quotes.
     // This is needed for view compatibility between Impala and Hive.
-    String aliasSql = ToSqlUtils.getHiveIdentSql(alias_);
+    String aliasSql = ToSqlUtils.getIdentSql(alias_);
     return "(" + queryStmt_.toSql() + ") " + aliasSql;
   }
 }

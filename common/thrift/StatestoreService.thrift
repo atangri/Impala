@@ -22,6 +22,26 @@ enum StatestoreServiceVersion {
    V1
 }
 
+// Structure serialized for the topic AdmissionController::IMPALA_REQUEST_QUEUE_TOPIC.
+// Statistics for a single pool. If RM is used, this is a YARN 'queue'. The topic key is
+// of the form "<pool_name>!<backend_id>".
+struct TPoolStats {
+  // The current number of admitted requests that are running. This is an instantaneous
+  // value (as opposed to a cumulative sum).
+  1: required i64 num_running;
+
+  // The current number of queued requests. This is an instantaneous value.
+  2: required i64 num_queued;
+
+  // The current memory used (in bytes) by everything executing in this pool on this
+  // backend.
+  3: required i64 mem_usage;
+
+  // The sum of the cluster memory estimates from planning (in bytes) by all running
+  // requests in this pool.
+  4: required i64 mem_estimate;
+}
+
 // Structure serialised in the Impala backend topic. Each Impalad
 // constructs one TBackendDescriptor, and registers it in the backend
 // topic. Impalads subscribe to this topic to learn of the location of
@@ -141,6 +161,11 @@ struct TUpdateStateResponse {
 
   // List of updates published by the subscriber to be made centrally by the statestore
   2: required list<TTopicDelta> topic_updates;
+
+  // True if this update was skipped by the subscriber. This is distinguished from a
+  // non-OK status since the former indicates an error which contributes to the
+  // statestore's view of a subscriber's liveness.
+  3: optional bool skipped;
 }
 
 service StatestoreSubscriber {

@@ -104,7 +104,7 @@ class HdfsScanNode : public ScanNode {
 
   int limit() const { return limit_; }
 
-  bool compact_data() const { return compact_data_; }
+  bool requires_compaction() const { return requires_compaction_; }
 
   const std::vector<SlotDescriptor*>& materialized_slots()
       const { return materialized_slots_; }
@@ -168,9 +168,12 @@ class HdfsScanNode : public ScanNode {
   void AddMaterializedRowBatch(RowBatch* row_batch);
 
   // Allocate a new scan range object, stored in the runtime state's object pool.
+  // For scan ranges that correspond to the original hdfs splits, the partition id
+  // must be set to the range's partition id. For other ranges (e.g. columns in parquet,
+  // read past buffers), the partition_id is unused.
   // This is thread safe.
   DiskIoMgr::ScanRange* AllocateScanRange(const char* file, int64_t len, int64_t offset,
-      int64_t partition_id, int disk_id);
+      int64_t partition_id, int disk_id, bool try_cache);
 
   // Adds ranges to the io mgr queue and starts up new scanner threads if possible.
   Status AddDiskIoRanges(const std::vector<DiskIoMgr::ScanRange*>& ranges);
@@ -238,7 +241,7 @@ class HdfsScanNode : public ScanNode {
       const std::vector<TScanRangeParams>& scan_range_params_list,
       PerVolumnStats* per_volume_stats);
 
-  // Output the per_volume_stats to stringsteam. The output format is a list of:
+  // Output the per_volume_stats to stringstream. The output format is a list of:
   // <volume id>:<# splits>/<per volume split lengths>
   static void PrintHdfsSplitStats(const PerVolumnStats& per_volume_stats,
       std::stringstream* ss);
@@ -258,10 +261,10 @@ class HdfsScanNode : public ScanNode {
   // Tuple id resolved in Prepare() to set tuple_desc_;
   const int tuple_id_;
 
-  // Copy strings to tuple memory pool if true.
-  // We try to avoid the overhead copying strings if the data will just
-  // stream to another node that will release the memory.
-  bool compact_data_;
+  // If true, scanners need to compact the resulting tuples. This is only true if
+  // the planner marked this node as producing compact row batches and there are
+  // materialized string slots.
+  bool requires_compaction_;
 
   // ReaderContext object to use with the disk-io-mgr
   DiskIoMgr::ReaderContext* reader_context_;
@@ -306,15 +309,20 @@ class HdfsScanNode : public ScanNode {
   typedef std::map<THdfsFileFormat::type, std::list<llvm::Function*> > CodegendFnMap;
   CodegendFnMap codegend_fn_map_;
 
+  // All conjunct copies that are created, including codegen'd and noncodegen'd
+  // conjuncts.
+  // TODO: remove when exprs are threadsafe
+  std::list<std::vector<Expr*>*> all_conjuncts_copies_;
+
   // Copies of the conjuncts for use by the scanners when they cannot use codegen'd
   // functions.
   // TODO: We will only need one copy once exprs are threadsafe.
-  boost::mutex conjuncts_copies_lock_;
-  std::list<std::vector<Expr*>*> conjuncts_copies_;
+  SpinLock interpreted_conjuncts_copies_lock_;
+  std::list<std::vector<Expr*>*> interpreted_conjuncts_copies_;
 
   // The number of non-codegen'd conjuncts copies we made in CreateConjunctsCopies(). Used
   // for debugging.
-  int num_conjuncts_copies_;
+  int num_interpreted_conjuncts_copies_;
 
   // Total number of partition slot descriptors, including non-materialized ones.
   int num_partition_keys_;
@@ -372,6 +380,9 @@ class HdfsScanNode : public ScanNode {
 
   // Total number of bytes read via short circuit read
   RuntimeProfile::Counter* bytes_read_short_circuit_;
+
+  // Total number of bytes read from data node cache
+  RuntimeProfile::Counter* bytes_read_dn_cache_;
 
   // Lock protects access between scanner thread and main query thread (the one calling
   // GetNext()) for all fields below.  If this lock and any other locks needs to be taken

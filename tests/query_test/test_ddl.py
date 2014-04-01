@@ -125,7 +125,7 @@ class TestDdlStatements(ImpalaTestSuite):
 
   @pytest.mark.execute_serially
   def test_create_drop_function(self, vector):
-    # This will create and drop the same function repeatedly, exercising the
+    # This will create, run, and drop the same function repeatedly, exercising the
     # lib cache mechanism.
     # TODO: it's hard to tell that the cache is working (i.e. if it did
     # nothing to drop the cache, these tests would still pass). Testing
@@ -133,13 +133,16 @@ class TestDdlStatements(ImpalaTestSuite):
     # the middle.
     create_fn_stmt = """create function f() returns int
         location '/test-warehouse/libTestUdfs.so' symbol='NoArgs'"""
+    select_stmt = """select f() from functional.alltypes limit 10"""
     drop_fn_stmt = "drop function f()"
     self.__create_db_synced('udf_test', vector)
+    self.client.set_configuration(vector.get_value('exec_option'))
 
     self.client.execute("use udf_test")
     self.client.execute("drop function if exists f()")
-    for i in xrange(1, 5):
+    for i in xrange(1, 10):
       self.client.execute(create_fn_stmt)
+      self.client.execute(select_stmt)
       self.client.execute(drop_fn_stmt)
 
   @pytest.mark.execute_serially

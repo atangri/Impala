@@ -18,8 +18,7 @@ import com.cloudera.impala.catalog.HdfsPartition;
 import com.cloudera.impala.catalog.HdfsPartition.FileDescriptor;
 import com.cloudera.impala.catalog.HdfsTable;
 import com.cloudera.impala.catalog.Table;
-import com.cloudera.impala.catalog.TableLoadingException;
-import com.cloudera.impala.thrift.TUniqueId;
+import com.cloudera.impala.thrift.ImpalaInternalServiceConstants;
 
 /**
  * Utility to generate an output file with all the block ids for each table
@@ -45,16 +44,11 @@ public class BlockIdGenerator {
       writer = new FileWriter(output);
 
       // Load all tables in the catalog
-      Catalog catalog = new CatalogServiceCatalog(new TUniqueId(0, 0));
+      Catalog catalog = CatalogServiceCatalog.createForTesting(true);
       for (String dbName: catalog.getDbNames(null)) {
         Db database = catalog.getDb(dbName);
         for (String tableName: database.getAllTableNames()) {
-          Table table = null;
-          try {
-            table = database.getTable(tableName);
-          } catch (TableLoadingException e) {
-            continue;
-          }
+          Table table = database.getTable(tableName);
           // Only do this for hdfs tables
           if (table == null || !(table instanceof HdfsTable)) {
             continue;
@@ -64,10 +58,14 @@ public class BlockIdGenerator {
           // Write the output as <tablename>: <blockid1> <blockid2> <etc>
           writer.write(tableName + ":");
           for (HdfsPartition partition: hdfsTable.getPartitions()) {
+            // Ignore the default partition.
+            if (partition.getId() ==
+                    ImpalaInternalServiceConstants.DEFAULT_PARTITION_ID) {
+              continue;
+            }
             List<FileDescriptor> fileDescriptors = partition.getFileDescriptors();
             for (FileDescriptor fd : fileDescriptors) {
-              String path = fd.getFilePath();
-              Path p = new Path(path);
+              Path p = new Path(partition.getLocation(), fd.getFileName());
 
               // Use a deprecated API to get block ids
               DistributedFileSystem dfs =

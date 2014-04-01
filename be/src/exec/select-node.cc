@@ -39,7 +39,7 @@ Status SelectNode::Prepare(RuntimeState* state) {
 }
 
 Status SelectNode::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
+  RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_ERROR(child(0)->Open(state));
   return Status::OK;
 }
@@ -61,6 +61,7 @@ Status SelectNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) 
   while (true) {
     if (child_row_idx_ == child_row_batch_->num_rows()) {
       // fetch next batch
+      child_row_batch_->TransferResourceOwnership(row_batch);
       child_row_batch_->Reset();
       RETURN_IF_ERROR(child(0)->GetNext(state, child_row_batch_.get(), &child_eos_));
       child_row_idx_ = 0;
@@ -99,7 +100,7 @@ bool SelectNode::CopyRows(RowBatch* output_batch) {
       if (ReachedLimit()) return true;
     }
   }
-  return output_batch->IsFull() || output_batch->AtResourceLimit();
+  return output_batch->AtCapacity();
 }
 
 void SelectNode::Close(RuntimeState* state) {

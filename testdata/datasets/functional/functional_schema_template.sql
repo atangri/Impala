@@ -740,6 +740,26 @@ LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/text-dollar-hash-pipe.txt' O
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
+text_thorn_ecirc_newline
+---- COLUMNS
+col1 string
+col2 string
+col3 int
+col4 int
+---- ROW_FORMAT
+-- -2 => ASCII 254 (thorn character) and -22 is a lowercase e with a circumflex
+delimited fields terminated by '-2' escaped by '-22' lines terminated by '\n'
+---- LOAD
+-- Hive has a bug where it will not load a table's table metadata if ESCAPED BY and
+-- TERMINATED BY are specified at the same time and set to extended ASCII characters.
+-- To work around this, the data file is loaded into a temp table with the same location.
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}_tmp(i int) LOCATION '/test-warehouse/{table_name}';
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/text-thorn-ecirc-newline.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name}_tmp;
+DROP TABLE {db_name}{db_suffix}.{table_name}_tmp;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
 overflow
 ---- COLUMNS
 tinyint_col tinyint
@@ -949,9 +969,10 @@ e double
 ---- ROW_FORMAT
 delimited fields terminated by ','
 ---- DEPENDENT_LOAD
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} select 'a', '', NULL, NULL, NULL from {db_name}.alltypes limit 1;
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} select * from functional.nulltable;
 ---- LOAD
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} select 'a', '', NULL, NULL, NULL from {db_name}.alltypes limit 1;
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/NullTable/data.csv'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -966,9 +987,10 @@ e double
 ---- ROW_FORMAT
 delimited fields terminated by ',' escaped by '\\'
 ---- DEPENDENT_LOAD
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} select 'a', '', NULL, NULL, NULL from {db_name}.alltypes limit 1;
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} select * from functional.nulltable;
 ---- LOAD
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} select 'a', '', NULL, NULL, NULL from {db_name}.alltypes limit 1;
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/NullTable/data.csv'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -1179,3 +1201,27 @@ bad_serde
 CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (col int)
 ROW FORMAT serde "org.apache.hadoop.hive.serde2.binarysortable.BinarySortableSerDe";
 ====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+rcfile_lazy_binary_serde
+---- CREATE_HIVE
+-- For incompatible SerDe testing
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (int_col int)
+ROW FORMAT SERDE
+  'org.apache.hadoop.hive.serde2.columnar.LazyBinaryColumnarSerDe'
+STORED AS INPUTFORMAT
+  'org.apache.hadoop.hive.ql.io.RCFileInputFormat'
+OUTPUTFORMAT
+  'org.apache.hadoop.hive.ql.io.RCFileOutputFormat';
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+decimal_tbl
+---- COLUMNS
+d1 DECIMAL
+d2 DECIMAL(10, 0)
+d3 DECIMAL(20, 10)
+d4 DECIMAL(38, 38)
+d5 DECIMAL(10, 5)

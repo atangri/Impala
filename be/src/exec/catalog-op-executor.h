@@ -19,10 +19,11 @@
 #include <boost/scoped_ptr.hpp>
 #include "gen-cpp/cli_service_types.h"
 #include "gen-cpp/Frontend_types.h"
-#include "runtime/client-cache.h"
 
 namespace impala {
 
+class ExecEnv;
+class Frontend;
 class Status;
 
 // The CatalogOpExecutor is responsible for executing catalog operations.
@@ -31,11 +32,15 @@ class Status;
 // operation.
 class CatalogOpExecutor {
  public:
-  CatalogOpExecutor(CatalogServiceClientCache* client_cache)
-      : client_cache_(client_cache) {}
+  CatalogOpExecutor(ExecEnv* env, Frontend* fe) : env_(env), fe_(fe) {}
 
   // Executes the given catalog operation against the catalog server.
   Status Exec(const TCatalogOpRequest& catalog_op);
+
+  // Fetches the metadata for the specific TCatalogObject descriptor from the catalog
+  // server. If the catalog server does not have the object cached, its metadata will
+  // be loaded.
+  Status GetCatalogObject(const TCatalogObject& object_desc, TCatalogObject* result);
 
   // Translates the given compute stats params and its child-query results into
   // a new table alteration request for updating the stats metadata, and executes
@@ -45,6 +50,12 @@ class CatalogOpExecutor {
       const apache::hive::service::cli::thrift::TRowSet& tbl_stats_data,
       const apache::hive::service::cli::thrift::TTableSchema& col_stats_schema,
       const apache::hive::service::cli::thrift::TRowSet& col_stats_data);
+
+  // Makes an RPC to the CatalogServer to prioritize the loading of the catalog objects
+  // specified in the TPrioritizeLoadRequest. Returns OK if the RPC was successful,
+  // otherwise a bad status will be returned.
+  Status PrioritizeLoad(const TPrioritizeLoadRequest& req,
+      TPrioritizeLoadResponse* result);
 
   // Set in Exec(), returns a pointer to the TDdlExecResponse of the DDL execution.
   // If called before Exec(), this will return NULL. Only set if the
@@ -78,9 +89,12 @@ class CatalogOpExecutor {
   // Result of executing a DDL request using the CatalogService
   boost::scoped_ptr<TCatalogUpdateResult> catalog_update_result_;
 
-  // Client cache to use when making connections to the catalog service. Not owned by this
-  // class.
-  CatalogServiceClientCache* client_cache_;
+  ExecEnv* env_;
+  Frontend* fe_;
+
+  // Handles additional BE work that needs to be done for drop function, in particular,
+  // clearing the local library cache for this function.
+  void HandleDropFunction(const TDropFunctionParams&);
 };
 
 }

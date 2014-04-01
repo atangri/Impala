@@ -17,8 +17,10 @@
 #include <boost/date_time/posix_time/posix_time.hpp>
 
 #include "common/logging.h"
+#include "testutil/test-udfs.h"
 #include "udf/udf-test-harness.h"
 
+using namespace boost;
 using namespace boost::posix_time;
 using namespace boost::gregorian;
 using namespace impala;
@@ -100,7 +102,7 @@ IntVal NumVarArgs(FunctionContext*, const BigIntVal& dummy, int n, const IntVal*
 }
 
 IntVal ValidateUdf(FunctionContext* context) {
-  EXPECT_EQ(context->version(), FunctionContext::v1_2);
+  EXPECT_EQ(context->version(), FunctionContext::v1_3);
   EXPECT_FALSE(context->has_error());
   EXPECT_TRUE(context->error_msg() == NULL);
   return IntVal::null();
@@ -135,10 +137,47 @@ StringVal TimeToString(FunctionContext* context, const TimestampVal& time) {
   return result;
 }
 
+void ValidateSharedStatePrepare(
+    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    // TODO: NYI
+    // const FunctionContext::TypeDesc* arg_type = context->GetArgType(0);
+    // ASSERT_TRUE(arg_type != NULL);
+    // ASSERT_EQ(arg_type->type, FunctionContext::TYPE_SMALLINT);
+    SmallIntVal* bytes = reinterpret_cast<SmallIntVal*>(context->GetConstantArg(0));
+    ASSERT_TRUE(bytes != NULL);
+    uint8_t* state = context->Allocate(bytes->val);
+    context->SetFunctionState(scope, state);
+  }
+}
+
+SmallIntVal ValidateSharedState(FunctionContext* context, SmallIntVal bytes) {
+  void* state = context->GetFunctionState(FunctionContext::THREAD_LOCAL);
+  EXPECT_TRUE(state != NULL);
+  memset(state, 0, bytes.val);
+  return SmallIntVal::null();
+}
+
+void ValidateSharedStateClose(
+    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    void* state = context->GetFunctionState(scope);
+    context->Free(reinterpret_cast<uint8_t*>(state));
+    context->SetFunctionState(scope, NULL);
+  }
+}
+
 TEST(UdfTest, TestFunctionContext) {
   EXPECT_TRUE(UdfTestHarness::ValidateUdf<IntVal>(ValidateUdf, IntVal::null()));
   EXPECT_FALSE(UdfTestHarness::ValidateUdf<IntVal>(ValidateFail, IntVal::null()));
   EXPECT_TRUE(UdfTestHarness::ValidateUdf<IntVal>(ValidateMem, IntVal::null()));
+
+  scoped_ptr<SmallIntVal> arg(new SmallIntVal(100));
+  vector<AnyVal*> constant_args;
+  constant_args.push_back(arg.get());
+  EXPECT_TRUE((UdfTestHarness::ValidateUdf<SmallIntVal, SmallIntVal>(
+      ValidateSharedState, *arg, SmallIntVal::null(),
+      ValidateSharedStatePrepare, ValidateSharedStateClose, constant_args)));
 }
 
 TEST(UdfTest, TestValidate) {
@@ -186,6 +225,23 @@ TEST(UdfTest, TestVarArgs) {
   args.resize(10);
   EXPECT_TRUE((UdfTestHarness::ValidateUdf<IntVal, BigIntVal, IntVal>(
       NumVarArgs, BigIntVal(0), args, IntVal(args.size()))));
+}
+
+TEST(UdfTest, MemTest) {
+  scoped_ptr<BigIntVal> bytes_arg(new BigIntVal(1000));
+  vector<AnyVal*> constant_args;
+  constant_args.push_back(bytes_arg.get());
+
+  EXPECT_TRUE((UdfTestHarness::ValidateUdf<BigIntVal, BigIntVal>(
+      ::MemTest, *bytes_arg, *bytes_arg, ::MemTestPrepare, ::MemTestClose,
+      constant_args)));
+
+  EXPECT_FALSE((UdfTestHarness::ValidateUdf<BigIntVal, BigIntVal>(
+      ::MemTest, *bytes_arg, *bytes_arg, ::MemTestPrepare, NULL, constant_args)));
+
+  EXPECT_FALSE((UdfTestHarness::ValidateUdf<BigIntVal, BigIntVal>(
+      ::DoubleFreeTest, *bytes_arg, *bytes_arg)));
+
 }
 
 int main(int argc, char** argv) {

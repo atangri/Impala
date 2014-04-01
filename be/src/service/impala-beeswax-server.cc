@@ -67,10 +67,6 @@ using namespace std;
 using namespace boost;
 using namespace boost::algorithm;
 using namespace apache::thrift;
-using namespace apache::thrift::protocol;
-using namespace apache::thrift::transport;
-using namespace apache::thrift::server;
-using namespace apache::thrift::concurrency;
 using namespace apache::hive::service::cli::thrift;
 using namespace beeswax;
 
@@ -90,10 +86,16 @@ class ImpalaServer::AsciiQueryResultSet : public ImpalaServer::QueryResultSet {
  public:
   // Rows are added into rowset.
   AsciiQueryResultSet(const TResultSetMetadata& metadata, vector<string>* rowset)
-    : metadata_(metadata), result_set_(rowset) {
+    : metadata_(metadata), result_set_(rowset), owned_result_set_(NULL) {
   }
 
-  virtual ~AsciiQueryResultSet() {}
+  // Rows are added into a new rowset that is owned by this result set.
+  AsciiQueryResultSet(const TResultSetMetadata& metadata)
+    : metadata_(metadata), result_set_(new vector<string>()),
+      owned_result_set_(result_set_) {
+  }
+
+  virtual ~AsciiQueryResultSet() { }
 
   // Convert expr values (col_values) to ASCII using "\t" as column delimiter and store
   // it in this result set.
@@ -106,7 +108,7 @@ class ImpalaServer::AsciiQueryResultSet : public ImpalaServer::QueryResultSet {
       // ODBC-187 - ODBC can only take "\t" as the delimiter
       out_stream << (i > 0 ? "\t" : "");
       RawValue::PrintValue(col_values[i],
-          ThriftToType(metadata_.columns[i].columnType), scales[i], &out_stream);
+          ThriftToType(metadata_.columns[i].columnType.type), scales[i], &out_stream);
     }
     result_set_->push_back(out_stream.str());
     return Status::OK;
@@ -128,12 +130,37 @@ class ImpalaServer::AsciiQueryResultSet : public ImpalaServer::QueryResultSet {
     return Status::OK;
   }
 
+  virtual int AddRows(const QueryResultSet* other, int start_idx, int num_rows) {
+    const AsciiQueryResultSet* o = static_cast<const AsciiQueryResultSet*>(other);
+    if (start_idx >= o->result_set_->size()) return 0;
+    const int rows_added =
+        min(static_cast<size_t>(num_rows), o->result_set_->size() - start_idx);
+    result_set_->insert(result_set_->end(), o->result_set_->begin() + start_idx,
+        o->result_set_->begin() + start_idx + rows_added);
+    return rows_added;
+  }
+
+  virtual int64_t BytesSize(int start_idx, int num_rows) {
+    int64_t bytes = 0;
+    const int end = min(static_cast<size_t>(num_rows), result_set_->size() - start_idx);
+    for (int i = start_idx; i < start_idx + end; ++i) {
+      bytes += sizeof(result_set_[i]) + result_set_[i].capacity();
+    }
+    return bytes;
+  }
+
+  virtual size_t size() { return result_set_->size(); }
+
  private:
   // Metadata of the result set
   const TResultSetMetadata& metadata_;
 
-  // Points to the result set to be filled. Not owned here.
+  // Points to the result set to be filled. The result set this points to may be owned by
+  // this object, in which case owned_result_set_ is set.
   vector<string>* result_set_;
+
+  // Set to result_set_ if result_set_ is owned.
+  scoped_ptr<vector<string> > owned_result_set_;
 };
 
 void ImpalaServer::query(QueryHandle& query_handle, const Query& query) {
@@ -160,6 +187,7 @@ void ImpalaServer::query(QueryHandle& query_handle, const Query& query) {
   // us to advance query state to FINISHED or EXCEPTION
   Thread wait_thread(
       "impala-server", "wait-thread", &ImpalaServer::Wait, this, exec_state);
+  RAISE_IF_ERROR(exec_state->query_status(), SQLSTATE_GENERAL_ERROR);
 }
 
 void ImpalaServer::executeAndWait(QueryHandle& query_handle, const Query& query,
@@ -181,7 +209,7 @@ void ImpalaServer::executeAndWait(QueryHandle& query_handle, const Query& query,
     // transport, the username may be known at that time. If the username hasn't been set
     // yet, set it now.
     lock_guard<mutex> l(session->lock);
-    if (session->user.empty()) session->user = query.hadoop_user;
+    if (session->connected_user.empty()) session->connected_user = query.hadoop_user;
   }
 
   // raise Syntax error or access violation; it's likely to be syntax/analysis error
@@ -273,7 +301,7 @@ void ImpalaServer::get_results_metadata(ResultsMetadata& results_metadata,
     results_metadata.schema.__isset.fieldSchemas = true;
     results_metadata.schema.fieldSchemas.resize(result_set_md->columns.size());
     for (int i = 0; i < results_metadata.schema.fieldSchemas.size(); ++i) {
-      TPrimitiveType::type col_type = result_set_md->columns[i].columnType;
+      TPrimitiveType::type col_type = result_set_md->columns[i].columnType.type;
       results_metadata.schema.fieldSchemas[i].__set_type(
           TypeToOdbcString(ThriftToType(col_type)));
 
@@ -352,8 +380,16 @@ void ImpalaServer::get_log(string& log, const LogContextId& context) {
     LOG(ERROR) << str.str();
     return;
   }
+  stringstream error_log_ss;
+  // If the query status is !ok, include the status error message at the top of the log.
+  if (!exec_state->query_status().ok()) {
+    error_log_ss << exec_state->query_status().GetErrorMsg();
+    log = error_log_ss.str();
+  }
   if (exec_state->coord() != NULL) {
-    log = exec_state->coord()->GetErrorLog();
+    if (!exec_state->query_status().ok()) error_log_ss << "\n\n";
+    error_log_ss << exec_state->coord()->GetErrorLog();
+    log = error_log_ss.str();
   }
 }
 
@@ -457,8 +493,8 @@ Status ImpalaServer::QueryToTQueryContext(const Query& query,
     // transport, the username may be known at that time. If the username hasn't been set
     // yet, set it now.
     lock_guard<mutex> l(session->lock);
-    if (session->user.empty()) session->user = query.hadoop_user;
-    query_ctxt->session.user = session->user;
+    if (session->connected_user.empty()) session->connected_user = query.hadoop_user;
+    query_ctxt->session.connected_user = session->connected_user;
   }
 
   // Override default query options with Query.Configuration
@@ -517,7 +553,7 @@ Status ImpalaServer::FetchInternal(const TUniqueId& query_id,
     // TODO: As of today, the ODBC driver does not support boolean and timestamp data
     // type but it should. This is tracked by ODBC-189. We should verify that our
     // boolean and timestamp type are correctly recognized when ODBC-189 is closed.
-    TPrimitiveType::type col_type = result_metadata->columns[i].columnType;
+    TPrimitiveType::type col_type = result_metadata->columns[i].columnType.type;
     query_results->columns[i] = TypeToOdbcString(ThriftToType(col_type));
   }
   query_results->__isset.columns = true;

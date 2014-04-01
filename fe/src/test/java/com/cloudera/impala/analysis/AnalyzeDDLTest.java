@@ -23,7 +23,7 @@ import junit.framework.Assert;
 import org.junit.Test;
 
 import com.cloudera.impala.catalog.CatalogException;
-import com.cloudera.impala.catalog.PrimitiveType;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.common.AnalysisException;
 import com.google.common.collect.Lists;
 
@@ -227,7 +227,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalysisError("alter table functional.alltypes change column year year int",
         "Cannot modify partition column: year");
 
-    AnalysisError("alter table functional.alltypes change column int_col Tinyint_col int",
+    AnalysisError(
+        "alter table functional.alltypes change column int_col Tinyint_col int",
         "Column already exists: Tinyint_col");
 
     // Invalid column name.
@@ -378,7 +379,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalysisError("alter table functional.alltypes rename to functional.`%^&`",
         "Invalid table/view name: %^&");
 
-    AnalysisError("alter table functional.alltypes rename to db_does_not_exist.new_table",
+    AnalysisError(
+        "alter table functional.alltypes rename to db_does_not_exist.new_table",
         "Database does not exist: db_does_not_exist");
 
     // Cannot ALTER TABLE a view.
@@ -485,6 +487,33 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     // Cannot compute stats on a view.
     AnalysisError("compute stats functional.alltypes_view",
         "COMPUTE STATS not allowed on a view: functional.alltypes_view");
+
+    AnalyzesOk("compute stats functional_avro_snap.alltypes");
+    // Test mismatched column definitions and Avro schema (HIVE-6308, IMPALA-867).
+    // See testdata/avro_schema_resolution/create_table.sql for the CREATE TABLE stmts.
+    // Mismatched column type is ok because the conflict is resolved in favor of
+    // the type in the column definition list in the CREATE TABLE.
+    AnalyzesOk("compute stats functional_avro_snap.alltypes_type_mismatch");
+    // Missing column definition is ok because the schema mismatch is resolved
+    // in the CREATE TABLE.
+    AnalyzesOk("compute stats functional_avro_snap.alltypes_missing_coldef");
+    // Extra column definition is ok because the schema mismatch is resolved
+    // in the CREATE TABLE.
+    AnalyzesOk("compute stats functional_avro_snap.alltypes_extra_coldef");
+    // Mismatched column name.
+    AnalysisError("compute stats functional_avro_snap.schema_resolution_test",
+        "Cannot COMPUTE STATS on Avro table 'schema_resolution_test' because its " +
+            "column definitions do not match those in the Avro schema.\nDefinition of " +
+            "column 'col1' of type 'string' does not match the Avro-schema column " +
+            "'boolean1' of type 'BOOLEAN' at position '0'.\nPlease re-create the table " +
+            "with column definitions, e.g., using the result of 'SHOW CREATE TABLE'");
+    // No column definitions were given at all. This case is broken in Hive (HIVE-6308).
+    AnalysisError("compute stats functional_avro_snap.alltypes_no_coldef",
+        "Cannot COMPUTE STATS on Avro table 'alltypes_no_coldef' because its column " +
+            "definitions do not match those in the Avro schema.\nMissing column " +
+            "definition corresponding to Avro-schema column 'id' of type 'INT' at " +
+            "position '0'.\nPlease re-create the table with column definitions, e.g., " +
+            "using the result of 'SHOW CREATE TABLE'");
   }
 
   @Test
@@ -593,7 +622,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalyzesOk("create table functional.new_table (i int)");
     AnalyzesOk("create table if not exists functional.alltypes (i int)");
     AnalyzesOk("create table if not exists functional.new_tbl like functional.alltypes");
-    AnalyzesOk("create table if not exists functional.alltypes like functional.alltypes");
+    AnalyzesOk(
+        "create table if not exists functional.alltypes like functional.alltypes");
     AnalysisError("create table functional.alltypes like functional.alltypes",
         "Table already exists: functional.alltypes");
     AnalysisError("create table functional.new_table like functional.tbl_does_not_exist",
@@ -605,15 +635,44 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalyzesOk("create table functional.new_table (i int) row format delimited fields " +
         "terminated by '|'");
 
+    // TODO: add more tests
+    AnalyzesOk("create table new_table (i int) PARTITIONED BY (d decimal)");
+    AnalyzesOk("create table new_table(d1 decimal, d2 decimal(10), d3 decimal(5, 2))");
+    AnalysisError("create table new_table(d1 decimal(1,10))",
+        "Decimal scale (10) must be <= precision (1).");
+    AnalysisError("create table new_table(d1 decimal(0,0))",
+        "Decimal precision must be greater than 0.");
+    AnalysisError("create table new_table(d1 decimal(49,0))",
+        "Decimal precision must be <= 38.");
+
     // Note: Backslashes need to be escaped twice - once for Java and once for Impala.
     // For example, if this were a real query the value '\' would be stored in the
     // metastore for the ESCAPED BY field.
     AnalyzesOk("create table functional.new_table (i int) row format delimited fields " +
         "terminated by '\\t' escaped by '\\\\' lines terminated by '\\n'");
+    AnalyzesOk("create table functional.new_table (i int) row format delimited fields " +
+        "terminated by '\\001' escaped by '\\002' lines terminated by '\\n'");
+    AnalyzesOk("create table functional.new_table (i int) row format delimited fields " +
+        "terminated by '-2' escaped by '-3' lines terminated by '\\n'");
+    AnalyzesOk("create table functional.new_table (i int) row format delimited fields " +
+        "terminated by '-128' escaped by '127' lines terminated by '40'");
 
     AnalysisError("create table functional.new_table (i int) row format delimited " +
+        "fields terminated by '-2' escaped by '128' lines terminated by '\\n'",
+        "ESCAPED BY values and LINE/FIELD terminators must be specified as a single " +
+        "character or as a decimal value in the range [-128:127]: 128");
+    AnalysisError("create table functional.new_table (i int) row format delimited " +
+        "fields terminated by '-2' escaped by '127' lines terminated by '255'",
+        "ESCAPED BY values and LINE/FIELD terminators must be specified as a single " +
+        "character or as a decimal value in the range [-128:127]: 255");
+    AnalysisError("create table functional.new_table (i int) row format delimited " +
+        "fields terminated by '-129' escaped by '127' lines terminated by '\\n'",
+        "ESCAPED BY values and LINE/FIELD terminators must be specified as a single " +
+        "character or as a decimal value in the range [-128:127]: -129");
+    AnalysisError("create table functional.new_table (i int) row format delimited " +
         "fields terminated by '||' escaped by '\\\\' lines terminated by '\\n'",
-        "ESCAPED BY values and LINE/FIELD terminators must have length of 1: ||");
+        "ESCAPED BY values and LINE/FIELD terminators must be specified as a single " +
+        "character or as a decimal value in the range [-128:127]: ||");
 
     AnalysisError("create table db_does_not_exist.new_table (i int)",
         "Database does not exist: db_does_not_exist");
@@ -635,17 +694,17 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "Type 'DATETIME' is not supported as partition-column type in column: d");
 
     // Analysis of Avro schemas
-    AnalyzesOk("create table foo (i int) with serdeproperties ('avro.schema.url'=" +
+    AnalyzesOk("create table foo_avro (i int) with serdeproperties ('avro.schema.url'=" +
         "'hdfs://schema.avsc') stored as avro");
-    AnalyzesOk("create table foo (i int) stored as avro tblproperties " +
+    AnalyzesOk("create table foo_avro (i int) stored as avro tblproperties " +
         "('avro.schema.url'='hdfs://schema.avsc')");
-    AnalyzesOk("create table foo (i int) stored as avro tblproperties " +
+    AnalyzesOk("create table foo_avro (i int) stored as avro tblproperties " +
         "('avro.schema.literal'='{\"name\": \"my_record\"}')");
-    AnalysisError("create table foo (i int) stored as avro",
+    AnalysisError("create table foo_avro (i int) stored as avro",
         "No Avro schema provided for table: default.foo");
-    AnalysisError("create table foo (i int) stored as avro tblproperties ('a'='b')",
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties ('a'='b')",
         "No Avro schema provided for table: default.foo");
-    AnalysisError("create table foo (i int) stored as avro tblproperties " +
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
         "('avro.schema.url'='schema.avsc')", "avro.schema.url must be of form " +
         "\"http://path/to/schema/file\" or \"hdfs://namenode:port/path/to/schema/file" +
         "\", got schema.avsc");
@@ -677,7 +736,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
 
   @Test
   public void TestCreateView() throws AnalysisException {
-    AnalyzesOk("create view foo as select int_col, string_col from functional.alltypes");
+    AnalyzesOk(
+        "create view foo_new as select int_col, string_col from functional.alltypes");
     AnalyzesOk("create view functional.foo as select * from functional.alltypes");
     AnalyzesOk("create view if not exists foo as select * from functional.alltypes");
     AnalyzesOk("create view foo (a, b) as select int_col, string_col " +
@@ -762,6 +822,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "'_Z8IdentityPN10impala_udf15FunctionContextERKNS_10BooleanValE'";
     final String udfSuffix = " LOCATION '/test-warehouse/libTestUdfs.so' " +
         "SYMBOL=" + symbol;
+    final String udfSuffixIr = " LOCATION '/test-warehouse/test-udfs.ll' " +
+        "SYMBOL=" + symbol;
     final String hdfsPath = "hdfs://localhost:20500/test-warehouse/libTestUdfs.so";
 
     AnalyzesOk("create function foo() RETURNS int" + udfSuffix);
@@ -794,8 +856,33 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "SYMBOL='_Z8IdentityPN10impala_udf15FunctionContextERKNS_10BooleanValE'");
     AnalyzesOk("create function foo() RETURNS int LOCATION '/binary.JAR' SYMBOL='a'");
 
+    AnalyzesOk("create function foo() RETURNS decimal" + udfSuffix);
+    AnalyzesOk("create function foo() RETURNS decimal(38,10)" + udfSuffix);
+    AnalyzesOk("create function foo(Decimal, decimal(10, 2)) RETURNS int" + udfSuffix);
+    AnalysisError("create function foo() RETURNS decimal(100)" + udfSuffix,
+        "Decimal precision must be <= 38.");
+    AnalysisError("create function foo(Decimal(2, 3)) RETURNS int" + udfSuffix,
+        "Decimal scale (3) must be <= precision (2).");
+
     // Varargs
     AnalyzesOk("create function foo(INT...) RETURNS int" + udfSuffix);
+
+    // Prepare/Close functions
+    AnalyzesOk("create function foo() returns int" + udfSuffix
+        + " prepare_fn='ValidateOpenPrepare'" + " close_fn='ValidateOpenClose'");
+    AnalyzesOk("create function foo() returns int" + udfSuffixIr
+        + " prepare_fn='ValidateOpenPrepare'" + " close_fn='ValidateOpenClose'");
+    AnalyzesOk("create function foo() returns int" + udfSuffixIr
+        + " prepare_fn='_Z19ValidateOpenPreparePN10impala_udf15FunctionContextENS0_18FunctionStateScopeE'"
+        + " close_fn='_Z17ValidateOpenClosePN10impala_udf15FunctionContextENS0_18FunctionStateScopeE'");
+    AnalysisError("create function foo() returns int" + udfSuffix + " prepare_fn=''",
+        "Could not find symbol ''");
+    AnalysisError("create function foo() returns int" + udfSuffix + " close_fn=''",
+        "Could not find symbol ''");
+    AnalysisError("create function foo() returns int" + udfSuffix +
+        " prepare_fn='FakePrepare'",
+        "Could not find function FakePrepare(impala_udf::FunctionContext*, "+
+        "impala_udf::FunctionContext::FunctionStateScope) in: ");
 
     // Try to create a function with the same name as a builtin
     AnalysisError("create function sin(double) RETURNS double" + udfSuffix,
@@ -827,7 +914,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "SYMBOL='b'", "Could not find function b() in: " + hdfsPath);
     AnalysisError("create function foo() RETURNS int " +
         "LOCATION '/test-warehouse/libTestUdfs.so' " +
-        "SYMBOL=''", "Could not find symbol '' in: /test-warehouse/libTestUdfs.so");
+        "SYMBOL=''", "Could not find symbol ''");
     AnalysisError("create function foo() RETURNS int " +
         "LOCATION '/test-warehouse/libTestUdfs.so' " +
         "SYMBOL='_ZAB'",
@@ -889,9 +976,9 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalyzesOk("drop function if exists foo(double, int...)");
 
     // Add functions default.TestFn(), default.TestFn(double), default.TestFn(String...),
-    addTestFunction("TestFn", new ArrayList<PrimitiveType>(), false);
-    addTestFunction("TestFn", Lists.newArrayList(PrimitiveType.DOUBLE), false);
-    addTestFunction("TestFn", Lists.newArrayList(PrimitiveType.STRING), true);
+    addTestFunction("TestFn", new ArrayList<ColumnType>(), false);
+    addTestFunction("TestFn", Lists.newArrayList(ColumnType.DOUBLE), false);
+    addTestFunction("TestFn", Lists.newArrayList(ColumnType.STRING), true);
 
     AnalysisError("create function TestFn() RETURNS INT " + udfSuffix,
         "Function already exists: testfn()");
@@ -906,7 +993,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
 
     // Add default.TestFn(int, int)
     addTestFunction("TestFn",
-        Lists.newArrayList(PrimitiveType.INT, PrimitiveType.INT), false);
+        Lists.newArrayList(ColumnType.INT, ColumnType.INT), false);
     AnalyzesOk("drop function TestFn(int, int)");
     AnalysisError("drop function TestFn(int, int, int)",
         "Function does not exist: testfn(INT, INT, INT)");
@@ -935,7 +1022,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalysisError(
         "drop function functional.TestFn()", "Function does not exist: testfn()");
 
-    addTestFunction("udf_test", "TestFn", new ArrayList<PrimitiveType>(), false);
+    addTestFunction("udf_test", "TestFn", new ArrayList<ColumnType>(), false);
     AnalysisError(
         "drop database udf_test", "Cannot drop non-empty database: udf_test");
 
@@ -1004,6 +1091,13 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "INTERMEDIATE char(10)" + loc + "UPDATE_FN='AggUpdate'",
         "UDAs with an intermediate type, CHAR(10), that is different from the " +
         "return type, INT, are currently not supported.");
+    AnalysisError("create aggregate function foo(int) RETURNS int " +
+        "INTERMEDIATE decimal(10)" + loc + "UPDATE_FN='AggUpdate'",
+        "UDAs with an intermediate type, DECIMAL(10,0), that is different from the " +
+        "return type, INT, are currently not supported.");
+    AnalysisError("create aggregate function foo(int) RETURNS int " +
+        "INTERMEDIATE decimal(40)" + loc + "UPDATE_FN='AggUpdate'",
+        "Decimal precision must be <= 38.");
     //AnalyzesOk("create aggregate function foo(int) RETURNS int " +
     //    "INTERMEDIATE CHAR(10)" + loc + "UPDATE_FN='AggUpdate'");
     //AnalysisError("create aggregate function foo(int) RETURNS int " +
@@ -1021,7 +1115,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     // Invalid char(0) type.
     AnalysisError("create aggregate function foo(int) RETURNS int " +
         "INTERMEDIATE CHAR(0) LOCATION '/foo.so' UPDATE_FN='b'",
-        "Array size must be > 0. Size was set to: 0.");
+        "Char size must be > 0. Size was set to: 0.");
     AnalysisError("create aggregate function foo() RETURNS int" + loc,
         "UDAs must take at least one argument.");
     AnalysisError("create aggregate function foo(int) RETURNS int LOCATION " +

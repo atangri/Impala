@@ -74,7 +74,7 @@ Status HdfsSequenceScanner::InitNewRange() {
   SeqFileHeader* seq_header = reinterpret_cast<SeqFileHeader*>(header_);
   if (seq_header->is_compressed) {
     RETURN_IF_ERROR(Codec::CreateDecompressor(
-        data_buffer_pool_.get(), stream_->compact_data(),
+        data_buffer_pool_.get(), scan_node_->tuple_desc()->string_slots().empty(),
         header_->codec, &decompressor_));
   }
 
@@ -114,7 +114,6 @@ inline Status HdfsSequenceScanner::GetRecord(uint8_t** record_ptr,
     if (in_size < 0) {
       stringstream ss;
       ss << "Invalid record size: " << in_size;
-      if (state_->LogHasSpace()) state_->LogError(ss.str());
       return Status(ss.str());
     }
     uint8_t* compressed_data;
@@ -126,16 +125,12 @@ inline Status HdfsSequenceScanner::GetRecord(uint8_t** record_ptr,
       SCOPED_TIMER(decompress_timer_);
       RETURN_IF_ERROR(decompressor_->ProcessBlock(false, in_size, compressed_data,
           &len, &unparsed_data_buffer_));
+      VLOG_FILE << "Decompressed " << in_size << " to " << len;
     }
     *record_ptr = unparsed_data_buffer_;
     // Read the length of the record.
     int size = ReadWriteUtil::GetVLong(*record_ptr, record_len);
-    if (size == -1) {
-        stringstream ss;
-        ss << "Invalid record size";
-        if (state_->LogHasSpace()) state_->LogError(ss.str());
-        return Status(ss.str());
-    }
+    if (size == -1) return Status("Invalid record sizse");
     *record_ptr += size;
   } else {
     // Uncompressed records
@@ -143,7 +138,6 @@ inline Status HdfsSequenceScanner::GetRecord(uint8_t** record_ptr,
     if (*record_len < 0) {
       stringstream ss;
       ss << "Invalid record length: " << *record_len;
-      if (state_->LogHasSpace()) state_->LogError(ss.str());
       return Status(ss.str());
     }
     RETURN_IF_FALSE(
@@ -222,10 +216,7 @@ Status HdfsSequenceScanner::ProcessDecompressedBlock() {
     int bytes_read = ReadWriteUtil::GetVLong(
         next_record_in_compressed_block_, &record_locations_[i].len);
     if (UNLIKELY(bytes_read == -1)) {
-      stringstream ss;
-      ss << "Invalid record size in compressed block.";
-      if (state_->LogHasSpace()) state_->LogError(ss.str());
-      return Status(ss.str());
+      return Status("Invalid record sizes in compressed block.");
     }
     next_record_in_compressed_block_ += bytes_read;
     record_locations_[i].record = next_record_in_compressed_block_;
@@ -449,9 +440,10 @@ Status HdfsSequenceScanner::ReadBlockHeader() {
 Status HdfsSequenceScanner::ReadCompressedBlock() {
   // We are reading a new compressed block.  Pass the previous buffer pool
   // bytes to the batch.  We don't need them anymore.
-  if (!stream_->compact_data()) {
-    AttachPool(data_buffer_pool_.get());
+  if (!decompressor_->reuse_output_buffer()) {
+    AttachPool(data_buffer_pool_.get(), true);
   }
+
   RETURN_IF_FALSE(stream_->ReadVLong(
       &num_buffered_records_in_compressed_block_, &parse_status_));
   if (num_buffered_records_in_compressed_block_ < 0) {
@@ -479,7 +471,6 @@ Status HdfsSequenceScanner::ReadCompressedBlock() {
   if (block_size > MAX_BLOCK_SIZE || block_size < 0) {
     stringstream ss;
     ss << "Compressed block size is: " << block_size;
-    if (state_->LogHasSpace()) state_->LogError(ss.str());
     return Status(ss.str());
   }
 
@@ -491,6 +482,7 @@ Status HdfsSequenceScanner::ReadCompressedBlock() {
     SCOPED_TIMER(decompress_timer_);
     RETURN_IF_ERROR(decompressor_->ProcessBlock(false, block_size, compressed_data,
                                                 &len, &unparsed_data_buffer_));
+    VLOG_FILE << "Decompressed " << block_size << " to " << len;
     next_record_in_compressed_block_ = unparsed_data_buffer_;
   }
 

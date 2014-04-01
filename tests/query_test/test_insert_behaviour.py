@@ -21,7 +21,7 @@ import pytest
 class TestInsertBehaviour(ImpalaTestSuite):
   """Tests for INSERT behaviour that isn't covered by checking query results"""
 
-  @pytest.mark.excute_serially
+  @pytest.mark.execute_serially
   def test_insert_removes_staging_files(self):
     insert_staging_dir = \
       "test-warehouse/functional.db/insert_overwrite_nopart/.impala_insert_staging"
@@ -31,7 +31,7 @@ functional.insert_overwrite_nopart SELECT int_col FROM functional.tinyinttable""
     ls = self.hdfs_client.list_dir(insert_staging_dir)
     assert len(ls['FileStatuses']['FileStatus']) == 0
 
-  @pytest.mark.excute_serially
+  @pytest.mark.execute_serially
   def test_insert_preserves_hidden_files(self):
     """Test that INSERT OVERWRITE preserves hidden files in the root table directory"""
     table_dir = "test-warehouse/functional.db/insert_overwrite_nopart/"
@@ -58,3 +58,31 @@ functional.insert_overwrite_nopart SELECT int_col FROM functional.tinyinttable""
       except:
         err_msg = "Directory '%s' was unexpectedly deleted by INSERT OVERWRITE"
         pytest.fail(err_msg % (table_dir + dir))
+
+  @pytest.mark.execute_serially
+  def test_insert_alter_partition_location(self):
+    """Test that inserts after changing the location of a partition work correctly"""
+    partition_dir = "tmp/test_insert_alter_partition_location"
+
+    self.execute_query_expect_success(self.client, "DROP TABLE IF EXISTS "
+                                      "functional.insert_alter_partition_location")
+    self.hdfs_client.delete_file_dir(partition_dir, recursive=True)
+    self.hdfs_client.make_dir(partition_dir)
+
+    self.execute_query_expect_success(self.client,
+"CREATE TABLE functional.insert_alter_partition_location (c int) PARTITIONED BY (p int)")
+    self.execute_query_expect_success(self.client,
+"ALTER TABLE functional.insert_alter_partition_location ADD PARTITION(p=1)")
+    self.execute_query_expect_success(self.client,
+"ALTER TABLE functional.insert_alter_partition_location PARTITION(p=1) SET LOCATION '/%s'"
+      % partition_dir)
+    self.execute_query_expect_success(self.client,
+"INSERT OVERWRITE functional.insert_alter_partition_location PARTITION(p=1) VALUES(1)")
+
+    result = self.execute_query_expect_success(self.client,
+"SELECT COUNT(*) FROM functional.insert_alter_partition_location")
+    assert int(result.get_data()) == 1
+
+    # Should have created exactly one file in the partition dir (not in a subdirectory)
+    ls = self.hdfs_client.list_dir(partition_dir)
+    assert len(ls['FileStatuses']['FileStatus']) == 1

@@ -24,7 +24,6 @@
 #include <sstream>
 #include <boost/algorithm/string.hpp>
 #include <boost/foreach.hpp>
-#include <dlfcn.h>
 
 #include <hdfs.h>
 
@@ -51,6 +50,8 @@
 #include "gen-cpp/PlanNodes_types.h"
 
 DEFINE_int32(max_row_batches, 0, "the maximum size of materialized_row_batches_");
+DECLARE_string(cgroup_hierarchy_path);
+DECLARE_bool(enable_rm);
 
 using namespace boost;
 using namespace impala;
@@ -66,11 +67,11 @@ HdfsScanNode::HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode,
       thrift_plan_node_(new TPlanNode(tnode)),
       runtime_state_(NULL),
       tuple_id_(tnode.hdfs_scan_node.tuple_id),
-      compact_data_(tnode.compact_data),
+      requires_compaction_(tnode.compact_data),
       reader_context_(NULL),
       tuple_desc_(NULL),
       unknown_disk_id_warned_(false),
-      num_conjuncts_copies_(0),
+      num_interpreted_conjuncts_copies_(0),
       num_partition_keys_(0),
       disks_accessed_bitmap_(TCounterType::UNIT, 0),
       done_(false),
@@ -146,22 +147,20 @@ Status HdfsScanNode::CreateConjuncts(vector<Expr*>* expr, bool disable_codegen) 
   // TODO: we really need to stop having to create copies of exprs
   RETURN_IF_ERROR(Expr::CreateExprTrees(runtime_state_->obj_pool(),
       thrift_plan_node_->conjuncts, expr));
-  for (int i = 0; i < expr->size(); ++i) {
-    RETURN_IF_ERROR(Expr::Prepare((*expr)[i], runtime_state_, row_desc(),
-        disable_codegen));
-  }
+  all_conjuncts_copies_.push_back(expr);
+  RETURN_IF_ERROR(Expr::Prepare(*expr, runtime_state_, row_desc(), disable_codegen));
   return Status::OK;
 }
 
 DiskIoMgr::ScanRange* HdfsScanNode::AllocateScanRange(const char* file, int64_t len,
-    int64_t offset, int64_t partition_id, int disk_id) {
+    int64_t offset, int64_t partition_id, int disk_id, bool try_cache) {
   DCHECK_GE(disk_id, -1);
   if (disk_id == -1) {
     // disk id is unknown, assign it a random one.
     static int next_disk_id = 0;
     disk_id = next_disk_id++;
-
   }
+
   // TODO: we need to parse the config for the number of dirs configured for this
   // data node.
   disk_id %= runtime_state_->io_mgr()->num_disks();
@@ -170,8 +169,7 @@ DiskIoMgr::ScanRange* HdfsScanNode::AllocateScanRange(const char* file, int64_t 
       runtime_state_->obj_pool()->Add(new ScanRangeMetadata(partition_id));
   DiskIoMgr::ScanRange* range =
       runtime_state_->obj_pool()->Add(new DiskIoMgr::ScanRange());
-  range->Reset(file, len, offset, disk_id, metadata);
-
+  range->Reset(file, len, offset, disk_id, try_cache, metadata);
   return range;
 }
 
@@ -222,18 +220,18 @@ void HdfsScanNode::ReleaseCodegenFn(THdfsFileFormat::type type, Function* fn) {
 }
 
 vector<Expr*>* HdfsScanNode::GetConjuncts() {
-  unique_lock<mutex> l(conjuncts_copies_lock_);
-  DCHECK(!conjuncts_copies_.empty());
-  vector<Expr*>* conjuncts = conjuncts_copies_.back();
-  conjuncts_copies_.pop_back();
+  ScopedSpinLock l(&interpreted_conjuncts_copies_lock_);
+  DCHECK(!interpreted_conjuncts_copies_.empty());
+  vector<Expr*>* conjuncts = interpreted_conjuncts_copies_.back();
+  interpreted_conjuncts_copies_.pop_back();
   return conjuncts;
 }
 
 void HdfsScanNode::ReleaseConjuncts(vector<Expr*>* conjuncts) {
   DCHECK(conjuncts != NULL);
-  unique_lock<mutex> l(conjuncts_copies_lock_);
-  conjuncts_copies_.push_back(conjuncts);
-  DCHECK_LE(conjuncts_copies_.size(), num_conjuncts_copies_);
+  ScopedSpinLock l(&interpreted_conjuncts_copies_lock_);
+  interpreted_conjuncts_copies_.push_back(conjuncts);
+  DCHECK_LE(interpreted_conjuncts_copies_.size(), num_interpreted_conjuncts_copies_);
 }
 
 HdfsScanner* HdfsScanNode::CreateScanner(HdfsPartitionDescriptor* partition) {
@@ -291,8 +289,7 @@ Tuple* HdfsScanNode::InitEmptyTemplateTuple() {
   Tuple* template_tuple = NULL;
   {
     unique_lock<mutex> l(lock_);
-    template_tuple = reinterpret_cast<Tuple*>(
-        scan_node_pool_->Allocate(tuple_desc_->byte_size()));
+    template_tuple = Tuple::Create(tuple_desc_->byte_size(), scan_node_pool_.get());
   }
   memset(template_tuple, 0, tuple_desc_->byte_size());
   return template_tuple;
@@ -310,11 +307,19 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   tuple_desc_ = state->desc_tbl().GetTupleDescriptor(tuple_id_);
   DCHECK(tuple_desc_ != NULL);
 
+  if (!state->cgroup().empty()) {
+    scanner_threads_.SetCgroupsMgr(state->exec_env()->cgroups_mgr());
+    scanner_threads_.SetCgroup(state->cgroup());
+  }
+
   // One-time initialisation of state that is constant across scan ranges
   DCHECK(tuple_desc_->table_desc() != NULL);
   hdfs_table_ = static_cast<const HdfsTableDescriptor*>(tuple_desc_->table_desc());
   scan_node_pool_.reset(new MemPool(mem_tracker()));
-  compact_data_ |= tuple_desc_->string_slots().empty();
+
+  // If there are no materialized string cols, we never need to compact data
+  // (it is already compact).
+  requires_compaction_ &= tuple_desc_->string_slots().size() > 0;
 
   // Create mapping from column index in table to slot index in output tuple.
   // First, initialize all columns to SKIP_COLUMN.
@@ -332,6 +337,9 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   const vector<SlotDescriptor*>& slots = tuple_desc_->slots();
   for (size_t i = 0; i < slots.size(); ++i) {
     if (!slots[i]->is_materialized()) continue;
+    if (slots[i]->type() == TYPE_DECIMAL) {
+      return Status("Decimal is not yet implemented.");
+    }
     int col_idx = slots[i]->col_pos();
     DCHECK_LT(col_idx, column_idx_to_materialized_slot_idx_.size());
     DCHECK_EQ(column_idx_to_materialized_slot_idx_[col_idx], SKIP_COLUMN);
@@ -352,7 +360,7 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
     }
   }
 
-  hdfs_connection_ = state->fs_cache()->GetDefaultConnection();
+  hdfs_connection_ = HdfsFsCache::instance()->GetDefaultConnection();
   if (hdfs_connection_ == NULL) {
     string error_msg = GetStrErrMsg();
     stringstream ss;
@@ -406,9 +414,14 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
       ++num_ranges_missing_volume_id;
     }
 
+    bool try_cache = (*scan_range_params_)[i].is_cached;
+    if (runtime_state_->query_options().disable_cached_reads) {
+      DCHECK(!try_cache) << "Params should not have had this set.";
+    }
     file_desc->splits.push_back(
         AllocateScanRange(file_desc->filename.c_str(), split.length, split.offset,
-                          split.partition_id, (*scan_range_params_)[i].volume_id));
+                          split.partition_id, (*scan_range_params_)[i].volume_id,
+                          try_cache));
   }
 
   // Prepare all the partitions scanned by the scan node
@@ -437,7 +450,7 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   RETURN_IF_ERROR(CreateConjunctsCopies(THdfsFileFormat::AVRO));
   RETURN_IF_ERROR(CreateConjunctsCopies(THdfsFileFormat::PARQUET));
 
-  num_conjuncts_copies_ = conjuncts_copies_.size();
+  num_interpreted_conjuncts_copies_ = interpreted_conjuncts_copies_.size();
 
   // We need at least one scanner thread to make progress. We need to make this
   // reservation before any ranges are issued.
@@ -450,6 +463,12 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   runtime_state_->resource_pool()->SetThreadAvailableCb(
       bind<void>(mem_fn(&HdfsScanNode::ThreadTokenAvailableCb), this, _1));
 
+  if (runtime_state_->query_resource_mgr() != NULL) {
+    runtime_state_->query_resource_mgr()->AddVcoreAvailableCb(
+        bind<void>(mem_fn(&HdfsScanNode::ThreadTokenAvailableCb), this,
+            runtime_state_->resource_pool()));
+  }
+
   return Status::OK;
 }
 
@@ -457,11 +476,16 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
 // threads. The scanner subclasses are passed the initial splits.  Scanners are expected
 // to queue up a non-zero number of those splits to the io mgr (via the ScanNode).
 Status HdfsScanNode::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
+  RETURN_IF_ERROR(ExecNode::Open(state));
 
   if (file_descs_.empty()) {
     SetDone();
     return Status::OK;
+  }
+
+  for (list<vector<Expr*>*>::iterator it = all_conjuncts_copies_.begin();
+     it != all_conjuncts_copies_.end(); ++it) {
+    RETURN_IF_ERROR(Expr::Open(**it, state));
   }
 
   RETURN_IF_ERROR(runtime_state_->io_mgr()->RegisterReader(
@@ -498,6 +522,8 @@ Status HdfsScanNode::Open(RuntimeState* state) {
   bytes_read_local_ = ADD_COUNTER(runtime_profile(), "BytesReadLocal",
       TCounterType::BYTES);
   bytes_read_short_circuit_ = ADD_COUNTER(runtime_profile(), "BytesReadShortCircuit",
+      TCounterType::BYTES);
+  bytes_read_dn_cache_ = ADD_COUNTER(runtime_profile(), "BytesReadDataNodeCache",
       TCounterType::BYTES);
 
   // Create num_disks+1 bucket counters
@@ -553,14 +579,21 @@ void HdfsScanNode::Close(RuntimeState* state) {
   scanner_threads_.JoinAll();
 
   // All conjuncts should have been released
-  DCHECK_EQ(conjuncts_copies_.size(), num_conjuncts_copies_)
-      << "conjuncts_copies_ leak, check that ReleaseConjuncts() is being called";
+  DCHECK_EQ(interpreted_conjuncts_copies_.size(), num_interpreted_conjuncts_copies_)
+      << "interpreted_conjuncts_copies_ leak, check that ReleaseConjuncts() "
+      << "is being called";
 
   num_owned_io_buffers_ -= materialized_row_batches_->Cleanup();
   DCHECK_EQ(num_owned_io_buffers_, 0) << "ScanNode has leaked io buffers";
 
   if (reader_context_ != NULL) {
-    state->io_mgr()->UnregisterReader(reader_context_);
+    // There may still be io buffers used by parent nodes so we can't unregister the
+    // reader context yet. The runtime state keeps a list of all the reader contexts and
+    // they are unregistered when the fragment is closed.
+    state->reader_contexts()->push_back(reader_context_);
+    // Need to wait for all the active scanner threads to finish to ensure there is no
+    // more memory tracked by this scan node's mem tracker.
+    state->io_mgr()->WaitForDisksCompletion(reader_context_);
   }
 
   StopAndFinalizeCounters();
@@ -570,6 +603,11 @@ void HdfsScanNode::Close(RuntimeState* state) {
   DCHECK_EQ(active_hdfs_read_thread_counter_.value(), 0);
 
   if (scan_node_pool_.get() != NULL) scan_node_pool_->FreeAll();
+
+  for (list<vector<Expr*>*>::iterator it = all_conjuncts_copies_.begin();
+     it != all_conjuncts_copies_.end(); ++it) {
+    Expr::Close(**it, state);
+  }
 
   ScanNode::Close(state);
 }
@@ -610,6 +648,10 @@ void HdfsScanNode::ThreadTokenAvailableCb(ThreadResourceMgr::ResourcePool* pool)
   //  4. Don't start up if there are no thread tokens.
   bool started_scanner = false;
   while (true) {
+    if (runtime_state_->query_resource_mgr() != NULL &&
+        runtime_state_->query_resource_mgr()->IsVcoreOverSubscribed()) {
+      break;
+    }
     // The lock must be given up between loops in order to give writers to done_,
     // all_ranges_started_ etc. a chance to grab the lock.
     // TODO: This still leans heavily on starvation-free locks, come up with a more
@@ -627,6 +669,10 @@ void HdfsScanNode::ThreadTokenAvailableCb(ThreadResourceMgr::ResourcePool* pool)
     scanner_threads_.AddThread(
         new Thread("hdfs-scan-node", ss.str(), &HdfsScanNode::ScannerThread, this));
     started_scanner = true;
+
+    if (runtime_state_->query_resource_mgr() != NULL) {
+      runtime_state_->query_resource_mgr()->NotifyThreadUsageChange(1);
+    }
   }
   if (!started_scanner) ++num_skipped_tokens_;
 }
@@ -724,6 +770,9 @@ void HdfsScanNode::ScannerThread() {
   SCOPED_THREAD_COUNTER_MEASUREMENT(scanner_thread_counters());
   ScannerThreadHelper();
   COUNTER_UPDATE(&active_scanner_thread_counter_, -1);
+  if (runtime_state_->query_resource_mgr() != NULL) {
+    runtime_state_->query_resource_mgr()->NotifyThreadUsageChange(-1);
+  }
   runtime_state_->resource_pool()->ReleaseThreadToken(false);
 }
 
@@ -834,6 +883,14 @@ void HdfsScanNode::StopAndFinalizeCounters() {
     bytes_read_local_->Set(runtime_state_->io_mgr()->bytes_read_local(reader_context_));
     bytes_read_short_circuit_->Set(
         runtime_state_->io_mgr()->bytes_read_short_circuit(reader_context_));
+    bytes_read_dn_cache_->Set(
+        runtime_state_->io_mgr()->bytes_read_dn_cache(reader_context_));
+
+    ImpaladMetrics::IO_MGR_BYTES_READ->Increment(bytes_read_counter()->value());
+    ImpaladMetrics::IO_MGR_LOCAL_BYTES_READ->Increment(
+        bytes_read_local_->value());
+    ImpaladMetrics::IO_MGR_SHORT_CIRCUIT_BYTES_READ->Increment(
+        bytes_read_short_circuit_->value());
   }
 }
 
@@ -884,19 +941,19 @@ Status HdfsScanNode::CreateConjunctsCopies(THdfsFileFormat::type format) {
   }
 
   for (int i = 0; i < num_codegen_copies; ++i) {
-    vector<Expr*> conjuncts_copy;
-    RETURN_IF_ERROR(CreateConjuncts(&conjuncts_copy, false));
+    vector<Expr*>* conjuncts = pool_->Add(new vector<Expr*>());
+    RETURN_IF_ERROR(CreateConjuncts(conjuncts, false));
     Function* fn;
     switch (format) {
       case THdfsFileFormat::TEXT:
       case THdfsFileFormat::LZO_TEXT:
-        fn = HdfsTextScanner::Codegen(this, conjuncts_copy);
+        fn = HdfsTextScanner::Codegen(this, *conjuncts);
         break;
       case THdfsFileFormat::SEQUENCE_FILE:
-        fn = HdfsSequenceScanner::Codegen(this, conjuncts_copy);
+        fn = HdfsSequenceScanner::Codegen(this, *conjuncts);
         break;
       case THdfsFileFormat::AVRO:
-        fn = HdfsAvroScanner::Codegen(this, conjuncts_copy);
+        fn = HdfsAvroScanner::Codegen(this, *conjuncts);
         break;
       default:
         // No codegen for this format
@@ -919,13 +976,13 @@ Status HdfsScanNode::CreateConjunctsCopies(THdfsFileFormat::type format) {
   int num_noncodegen_copies = min(max_threads, num_splits);
 
   // No point making more copies than the maximum possible number of threads
-  while (num_noncodegen_copies > 0 && conjuncts_copies_.size() < max_threads) {
+  while (num_noncodegen_copies > 0 &&
+      interpreted_conjuncts_copies_.size() < max_threads) {
     vector<Expr*>* conjuncts = pool_->Add(new vector<Expr*>());
     RETURN_IF_ERROR(CreateConjuncts(conjuncts, true));
-    conjuncts_copies_.push_back(conjuncts);
+    interpreted_conjuncts_copies_.push_back(conjuncts);
     --num_noncodegen_copies;
   }
 
   return Status::OK;
 }
-

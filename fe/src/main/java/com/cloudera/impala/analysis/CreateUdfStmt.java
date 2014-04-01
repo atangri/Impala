@@ -17,19 +17,19 @@ package com.cloudera.impala.analysis;
 import java.util.HashMap;
 
 import com.cloudera.impala.catalog.AuthorizationException;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.PrimitiveType;
-import com.cloudera.impala.catalog.Udf;
+import com.cloudera.impala.catalog.ScalarFunction;
 import com.cloudera.impala.common.AnalysisException;
-import com.cloudera.impala.thrift.TCreateFunctionParams;
 import com.cloudera.impala.thrift.TFunctionBinaryType;
-import com.cloudera.impala.thrift.TScalarFunction;
+import com.cloudera.impala.thrift.TSymbolType;
 
 /**
  * Represents a CREATE FUNCTION statement.
  */
 public class CreateUdfStmt extends CreateFunctionStmtBase {
   // Same as super.fn_. Typed here for convenience.
-  private final Udf udf_;
+  private final ScalarFunction udf_;
 
   /**
    * Builds a CREATE FUNCTION statement
@@ -42,19 +42,10 @@ public class CreateUdfStmt extends CreateFunctionStmtBase {
    *        validated in analyze()
    */
   public CreateUdfStmt(FunctionName fnName, FunctionArgs args,
-      PrimitiveType retType, HdfsUri location, boolean ifNotExists,
+      ColumnType retType, HdfsUri location, boolean ifNotExists,
       HashMap<CreateFunctionStmtBase.OptArg, String> optArgs) {
-    super(new Udf(fnName, args, retType), location, ifNotExists, optArgs);
-    udf_ = (Udf)fn_;
-  }
-
-  @Override
-  public TCreateFunctionParams toThrift() {
-    TCreateFunctionParams params = super.toThrift();
-    TScalarFunction udf = new TScalarFunction();
-    udf.setSymbol(udf_.getSymbolName());
-    params.getFn().setScalar_fn(udf);
-    return params;
+    super(new ScalarFunction(fnName, args, retType), location, ifNotExists, optArgs);
+    udf_ = (ScalarFunction)fn_;
   }
 
   @Override
@@ -63,12 +54,12 @@ public class CreateUdfStmt extends CreateFunctionStmtBase {
     super.analyze(analyzer);
 
     if (udf_.getBinaryType() == TFunctionBinaryType.HIVE) {
-      if (udf_.getReturnType() == PrimitiveType.TIMESTAMP) {
+      if (udf_.getReturnType().getPrimitiveType() == PrimitiveType.TIMESTAMP) {
         throw new AnalysisException(
             "Hive UDFs that use timestamp are not yet supported.");
       }
       for (int i = 0; i < udf_.getNumArgs(); ++i) {
-        if (udf_.getArgs()[i] == PrimitiveType.TIMESTAMP) {
+        if (udf_.getArgs()[i].getPrimitiveType() == PrimitiveType.TIMESTAMP) {
           throw new AnalysisException(
               "Hive UDFs that use timestamp are not yet supported.");
         }
@@ -76,9 +67,19 @@ public class CreateUdfStmt extends CreateFunctionStmtBase {
     }
 
     // Check the user provided symbol exists
-    udf_.setSymbolName(lookupSymbol(
-        checkAndGetOptArg(OptArg.SYMBOL), null, fn_.hasVarArgs(),
-        ColumnType.toColumnType(fn_.getArgs())));
+    udf_.setSymbolName(udf_.lookupSymbol(
+        checkAndGetOptArg(OptArg.SYMBOL), TSymbolType.UDF_EVALUATE, null,
+        udf_.hasVarArgs(), udf_.getArgs()));
+
+    // Set optional Prepare/Close functions
+    String prepareFn = optArgs_.get(OptArg.PREPARE_FN);
+    if (prepareFn != null) {
+      udf_.setPrepareFnSymbol(udf_.lookupSymbol(prepareFn, TSymbolType.UDF_PREPARE));
+    }
+    String closeFn = optArgs_.get(OptArg.CLOSE_FN);
+    if (closeFn != null) {
+      udf_.setCloseFnSymbol(udf_.lookupSymbol(closeFn, TSymbolType.UDF_CLOSE));
+    }
 
     // Udfs should not set any of these
     checkOptArgNotSet(OptArg.UPDATE_FN);

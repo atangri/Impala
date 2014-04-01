@@ -74,7 +74,7 @@ struct TDdlExecRequest {
   // Parameters for CREATE FUNCTION
   9: optional JniCatalog.TCreateFunctionParams create_fn_params
 
-  // Paramaters for DROP DATABASE
+  // Parameters for DROP DATABASE
   10: optional JniCatalog.TDropDbParams drop_db_params
 
   // Parameters for DROP TABLE/VIEW
@@ -162,10 +162,45 @@ struct TGetFunctionsResponse {
   2: optional list<Types.TFunction> functions;
 }
 
+// Request the complete metadata for a given catalog object. May trigger a metadata load
+// if the object is not already in the catalog cache.
+struct TGetCatalogObjectRequest {
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
+
+  // A catalog object descriptor: a TCatalogObject with the object name and type fields
+  // set.
+  2: required CatalogObjects.TCatalogObject object_desc
+}
+
+// Response from TGetCatalogObjectRequest
+struct TGetCatalogObjectResponse {
+  1: required CatalogObjects.TCatalogObject catalog_object
+}
+
+// Instructs the Catalog Server to prioritizing loading of metadata for the specified
+// catalog objects. Currently only used for controlling the priority of loading
+// tables/views since Db/Function metadata is loaded on startup.
+struct TPrioritizeLoadRequest {
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
+
+  // A list of catalog objects descriptors for which to prioritize loading. A catalog
+  // object descriptor is a TCatalogObject with only the object name and type fields set.
+  2: required list<CatalogObjects.TCatalogObject> object_descs
+}
+
+struct TPrioritizeLoadResponse {
+  // The status of the operation, OK if the operation was successful.
+  1: optional Status.TStatus status
+}
+
+
 // The CatalogService API
 service CatalogService {
   // Executes a DDL request and returns details on the result of the operation.
   TDdlExecResponse ExecDdl(1: TDdlExecRequest req);
+
+  // Gets the catalog object corresponding to the given request.
+  TGetCatalogObjectResponse GetCatalogObject(1: TGetCatalogObjectRequest req);
 
   // Resets the Catalog metadata. Used to explicitly trigger reloading of the Hive
   // Metastore metadata and/or HDFS block location metadata.
@@ -178,4 +213,8 @@ service CatalogService {
   // Gets all user defined functions (aggregate and scalar) in the catalog matching
   // the parameters of TGetFunctionsRequest.
   TGetFunctionsResponse GetFunctions(1: TGetFunctionsRequest req);
+
+  // Prioritize the loading of metadata for the CatalogObjects specified in the
+  // TPrioritizeLoadRequest.
+  TPrioritizeLoadResponse PrioritizeLoad(1: TPrioritizeLoadRequest req);
 }

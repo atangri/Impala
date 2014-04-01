@@ -38,16 +38,20 @@ class RowDescriptor;
 // Superclass of all data sinks.
 class DataSink {
  public:
+  DataSink() : closed_(false) { }
   virtual ~DataSink() {}
 
-  // Setup. Call before Send() or Close().
-  virtual Status Init(RuntimeState* state) = 0;
+  // Setup. Call before Send(), Open(), or Close().
+  virtual Status Prepare(RuntimeState* state) = 0;
+
+  // Call before Send() or Close().
+  virtual Status Open(RuntimeState* state) = 0;
 
   // Send a row batch into this sink.
   // eos should be true when the last batch is passed to Send()
   virtual Status Send(RuntimeState* state, RowBatch* batch, bool eos) = 0;
 
-  // Releases all resources that were allocated in Init()/Send().
+  // Releases all resources that were allocated in Prepare()/Send().
   // Further Send() calls are illegal after calling Close().
   // It must be okay to call this multiple times. Subsequent calls should
   // be ignored.
@@ -71,6 +75,12 @@ class DataSink {
   // Outputs the insert stats to a string
   static std::string OutputInsertStats(const PartitionInsertStats& stats,
       const std::string& prefix = "");
+
+ protected:
+  // Set to true after Close() has been called. Subclasses should check and set this in
+  // Close().
+  bool closed_;
+
 };
 
 }  // namespace impala

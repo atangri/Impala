@@ -21,7 +21,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.cloudera.impala.catalog.AuthorizationException;
-import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.thrift.TExprNode;
 import com.cloudera.impala.thrift.TExprNodeType;
@@ -55,7 +54,7 @@ public class SlotRef extends Expr {
     super();
     this.tblName_ = tblName;
     this.col_ = col;
-    this.label_ = ToSqlUtils.getHiveIdentSql(col);
+    this.label_ = ToSqlUtils.getIdentSql(col);
   }
 
   // C'tor for a "pre-analyzed" ref to a slot
@@ -88,8 +87,15 @@ public class SlotRef extends Expr {
       throw new AnalysisException("Unsupported type '"
           + type_.toString() + "' in '" + toSql() + "'.");
     }
+    if (type_.isInvalid()) {
+      // In this case, the metastore contained a string we can't parse at all
+      // e.g. map. We could report a better error if we stored the original
+      // HMS string.
+      throw new AnalysisException("Unsupported type in '" + toSql() + "'.");
+    }
+    type_.analyze();
     numDistinctValues_ = desc_.getStats().getNumDistinctValues();
-    if (type_ == PrimitiveType.BOOLEAN) selectivity_ = DEFAULT_SELECTIVITY;
+    if (type_.isBoolean()) selectivity_ = DEFAULT_SELECTIVITY;
   }
 
   @Override
@@ -158,7 +164,7 @@ public class SlotRef extends Expr {
 
   @Override
   public void getIdsHelper(Set<TupleId> tupleIds, Set<SlotId> slotIds) {
-    Preconditions.checkState(type_ != PrimitiveType.INVALID_TYPE);
+    Preconditions.checkState(type_.isValid());
     Preconditions.checkState(desc_ != null);
     if (slotIds != null) slotIds.add(desc_.getId());
     if (tupleIds != null) tupleIds.add(desc_.getParent().getId());

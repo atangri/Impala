@@ -47,7 +47,7 @@ ostream& operator<<(ostream& os, const NullIndicatorOffset& null_indicator) {
 
 SlotDescriptor::SlotDescriptor(const TSlotDescriptor& tdesc)
   : id_(tdesc.id),
-    type_(ThriftToType(tdesc.slotType)),
+    type_(tdesc.slotType),
     parent_(tdesc.parent),
     col_pos_(tdesc.columnPos),
     tuple_offset_(tdesc.byteOffset),
@@ -60,9 +60,9 @@ SlotDescriptor::SlotDescriptor(const TSlotDescriptor& tdesc)
     set_null_fn_(NULL) {
 }
 
-std::string SlotDescriptor::DebugString() const {
+string SlotDescriptor::DebugString() const {
   stringstream out;
-  out << "Slot(id=" << id_ << " type=" << TypeToString(type_)
+  out << "Slot(id=" << id_ << " type=" << type_.DebugString()
       << " col=" << col_pos_ << " offset=" << tuple_offset_
       << " null=" << null_indicator_offset_.DebugString()
       << " slot_idx=" << slot_idx_ << " field_idx=" << field_idx_
@@ -91,6 +91,7 @@ HdfsPartitionDescriptor::HdfsPartitionDescriptor(const THdfsPartition& thrift_pa
     collection_delim_(thrift_partition.collectionDelim),
     escape_char_(thrift_partition.escapeChar),
     block_size_(thrift_partition.blockSize),
+    location_(thrift_partition.location),
     compression_(thrift_partition.compression),
     exprs_prepared_(false),
     file_format_(thrift_partition.fileFormat),
@@ -107,7 +108,7 @@ HdfsPartitionDescriptor::HdfsPartitionDescriptor(const THdfsPartition& thrift_pa
 }
 
 Status HdfsPartitionDescriptor::PrepareExprs(RuntimeState* state) {
-  if (exprs_prepared_ == false) {
+  if (!exprs_prepared_) {
     // TODO: RowDescriptor should arguably be optional in Prepare for known literals
     exprs_prepared_ = true;
     // Partition exprs are not used in the codegen case.  Don't codegen them.
@@ -203,7 +204,7 @@ TupleDescriptor::TupleDescriptor(const TTupleDescriptor& tdesc)
 
 void TupleDescriptor::AddSlot(SlotDescriptor* slot) {
   slots_.push_back(slot);
-  if (slot->type() == TYPE_STRING && slot->is_materialized()) {
+  if (slot->type().type == TYPE_STRING && slot->is_materialized()) {
     string_slots_.push_back(slot);
   }
   if (slot->is_materialized()) ++num_materialized_slots_;
@@ -226,8 +227,8 @@ string TupleDescriptor::DebugString() const {
 }
 
 RowDescriptor::RowDescriptor(const DescriptorTbl& desc_tbl,
-                             const std::vector<TTupleId>& row_tuples,
-                             const std::vector<bool>& nullable_tuples)
+                             const vector<TTupleId>& row_tuples,
+                             const vector<bool>& nullable_tuples)
   : tuple_idx_nullable_map_(nullable_tuples) {
   DCHECK_EQ(nullable_tuples.size(), row_tuples.size());
   for (int i = 0; i < row_tuples.size(); ++i) {
@@ -238,7 +239,7 @@ RowDescriptor::RowDescriptor(const DescriptorTbl& desc_tbl,
 }
 
 RowDescriptor::RowDescriptor(const vector<TupleDescriptor*>& tuple_descs,
-                             const std::vector<bool>& nullable_tuples)
+                             const vector<bool>& nullable_tuples)
   : tuple_desc_map_(tuple_descs),
     tuple_idx_nullable_map_(nullable_tuples) {
   DCHECK_EQ(nullable_tuples.size(), tuple_descs.size());
@@ -267,10 +268,7 @@ int RowDescriptor::GetRowSize() const {
 }
 
 int RowDescriptor::GetTupleIdx(TupleId id) const {
-  if (id >= tuple_idx_map_.size()) {
-    LOG(INFO) << "RowDescriptor: " << DebugString();
-  }
-  DCHECK_LT(id, tuple_idx_map_.size());
+  DCHECK_LT(id, tuple_idx_map_.size()) << "RowDescriptor: " << DebugString();
   return tuple_idx_map_[id];
 }
 
@@ -279,7 +277,7 @@ bool RowDescriptor::TupleIsNullable(int tuple_idx) const {
   return tuple_idx_nullable_map_[tuple_idx];
 }
 
-void RowDescriptor::ToThrift(std::vector<TTupleId>* row_tuple_ids) {
+void RowDescriptor::ToThrift(vector<TTupleId>* row_tuple_ids) {
   row_tuple_ids->clear();
   for (int i = 0; i < tuple_desc_map_.size(); ++i) {
     row_tuple_ids->push_back(tuple_desc_map_[i]->id());

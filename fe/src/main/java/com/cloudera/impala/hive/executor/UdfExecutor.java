@@ -37,6 +37,7 @@ import org.apache.hadoop.io.Writable;
 import org.apache.log4j.Logger;
 import org.apache.thrift.protocol.TBinaryProtocol;
 
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.ImpalaRuntimeException;
@@ -64,8 +65,8 @@ public class UdfExecutor {
 
   private UDF udf_;
   private Method method_;
-  private PrimitiveType[] argTypes_;
-  private PrimitiveType retType_;
+  private ColumnType[] argTypes_;
+  private ColumnType retType_;
 
   // Input buffer from the backend. This is valid for the duration of an evaluate() call.
   // These buffers are allocated in the BE.
@@ -93,6 +94,10 @@ public class UdfExecutor {
   // as these objects are reused across calls to evaluate().
   private Object[] inputObjects_;
   private Object[] inputArgs_; // inputArgs_[i] is either inputObjects_[i] or null
+  // True if inputArgs_[i] is the java String type (and not a writable). We need
+  // to make a String object before calling the UDF.
+  // TODO: is there a unsafe way to make string objects?
+  private boolean[] isArgString_;
 
   // Allocations made from the native heap that need to be cleaned when this object
   // is GC'ed.
@@ -108,10 +113,10 @@ public class UdfExecutor {
 
     String className = request.fn.scalar_fn.symbol;
     String jarFile = request.local_location;
-    PrimitiveType retType = PrimitiveType.fromThrift(request.fn.ret_type);
-    PrimitiveType[] parameterTypes = new PrimitiveType[request.fn.arg_types.size()];
+    ColumnType retType = ColumnType.fromThrift(request.fn.ret_type);
+    ColumnType[] parameterTypes = new ColumnType[request.fn.arg_types.size()];
     for (int i = 0; i < request.fn.arg_types.size(); ++i) {
-      parameterTypes[i] = PrimitiveType.fromThrift(request.fn.arg_types.get(i));
+      parameterTypes[i] = ColumnType.fromThrift(request.fn.arg_types.get(i));
     }
     inputBufferPtr_ = request.input_buffer_ptr;
     inputNullsPtr_ = request.input_nulls_ptr;
@@ -136,7 +141,7 @@ public class UdfExecutor {
    * @param udfPath: fully qualified class path for the UDF
    */
   public UdfExecutor(String jarFile, String udfPath,
-      PrimitiveType retType, PrimitiveType... parameterTypes)
+      ColumnType retType, ColumnType... parameterTypes)
       throws ImpalaRuntimeException {
 
     inputBufferOffsets_ = new int[parameterTypes.length];
@@ -190,7 +195,12 @@ public class UdfExecutor {
     try {
       for (int i = 0; i < argTypes_.length; ++i) {
         if (UnsafeUtil.UNSAFE.getByte(inputNullsPtr_ + i) == 0) {
-          inputArgs_[i] = inputObjects_[i];
+          if (isArgString_[i]) {
+            Preconditions.checkState(inputArgs_[i] instanceof ImpalaBytesWritable);
+            inputArgs_[i] = ((ImpalaBytesWritable)inputArgs_[i]).toString();
+          } else {
+            inputArgs_[i] = inputObjects_[i];
+          }
         } else {
           inputArgs_[i] = null;
         }
@@ -252,7 +262,7 @@ public class UdfExecutor {
   }
 
   // Sets the result object 'obj' into the outputBufferPtr_
-  private void storeUdfResult(Object obj) {
+  private void storeUdfResult(Object obj) throws ImpalaRuntimeException {
     if (obj == null) {
       UnsafeUtil.UNSAFE.putByte(outputNullPtr_, (byte)1);
       return;
@@ -260,7 +270,7 @@ public class UdfExecutor {
 
     UnsafeUtil.UNSAFE.putByte(outputNullPtr_, (byte)0);
 
-    switch (retType_) {
+    switch (retType_.getPrimitiveType()) {
       case BOOLEAN: {
         BooleanWritable val = (BooleanWritable)obj;
         UnsafeUtil.UNSAFE.putByte(outputBufferPtr_, val.get() ? (byte)1 : 0);
@@ -304,12 +314,10 @@ public class UdfExecutor {
           bytes = ((BytesWritable)obj).getBytes();
         } else if (obj instanceof Text) {
           bytes = ((Text)obj).getBytes();
-        }
-
-        if (bytes == null) {
-          // TODO: the returned string type is not one we expect
-          System.err.println("Unexpected return type: " + obj.getClass());
-          Preconditions.checkArgument(false);
+        } else if (obj instanceof String) {
+          bytes = ((String)obj).getBytes();
+        } else {
+          throw new ImpalaRuntimeException("Unexpected return type: " + obj.getClass());
         }
 
         if (bytes.length > outBufferCapacity_) {
@@ -326,19 +334,20 @@ public class UdfExecutor {
       }
       case TIMESTAMP:
       default:
-        Preconditions.checkArgument(false);
+        throw new ImpalaRuntimeException("Unsupported argument type: " + retType_);
     }
   }
 
   // Preallocate the input objects that will be passed to the underlying UDF.
   // These objects are allocated once and reused across calls to evaluate()
-  private void allocateInputObjects() {
+  private void allocateInputObjects() throws ImpalaRuntimeException {
     inputObjects_ = new Writable[argTypes_.length];
     inputArgs_ = new Writable[argTypes_.length];
+    isArgString_ = new boolean[argTypes_.length];
 
     for (int i = 0; i < argTypes_.length; ++i) {
       int offset = inputBufferOffsets_[i];
-      switch (argTypes_[i]) {
+      switch (argTypes_[i].getPrimitiveType()) {
         case BOOLEAN:
           inputObjects_[i] = new ImpalaBooleanWritable(inputBufferPtr_ + offset);
           break;
@@ -367,13 +376,20 @@ public class UdfExecutor {
           } else  if (method_.getParameterTypes()[i] == BytesWritable.class) {
             ImpalaBytesWritable w = new ImpalaBytesWritable(inputBufferPtr_ + offset);
             inputObjects_[i] = w;
+          } else if (method_.getParameterTypes()[i] == String.class) {
+            isArgString_[i] = true;
+            // String can be mapped to any String-like Writable class. We need
+            // to call toString on it before calling the UDF.
+            ImpalaBytesWritable w = new ImpalaBytesWritable(inputBufferPtr_ + offset);
+            inputObjects_[i] = w;
           } else {
-            Preconditions.checkArgument(false);
+            throw new ImpalaRuntimeException(
+                "Unsupported argument type: " + method_.getParameterTypes()[i]);
           }
           break;
         case TIMESTAMP:
         default:
-          Preconditions.checkArgument(false);
+          throw new ImpalaRuntimeException("Unsupported argument type: " + argTypes_[i]);
         }
     }
   }
@@ -392,7 +408,7 @@ public class UdfExecutor {
    * This uses reflection to look up the "evaluate" function in the UDF class.
    */
   private void init(String jarPath, String udfPath,
-      PrimitiveType retType, PrimitiveType... parameterTypes) throws
+      ColumnType retType, ColumnType... parameterTypes) throws
       ImpalaRuntimeException {
     ArrayList<String> signatures = Lists.newArrayList();
     try {
@@ -422,7 +438,7 @@ public class UdfExecutor {
 
         boolean incompatible = false;
         for (int i = 0; i < methodTypes.length; ++i) {
-          if (getPrimitiveType(methodTypes[i]) != parameterTypes[i]) {
+          if (getPrimitiveType(methodTypes[i]) != parameterTypes[i].getPrimitiveType()) {
             incompatible = true;
             break;
           }

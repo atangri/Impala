@@ -17,10 +17,10 @@ where b.month = 1
 00:MERGE
 |
 |--02:SCAN HDFS [functional.alltypes]
-|     partitions=2/24 size=80.64KB
+|     partitions=2/24 size=40.32KB
 |
 01:SCAN HDFS [functional.alltypes]
-   partitions=2/24 size=80.64KB
+   partitions=2/24 size=40.32KB
 ---- DISTRIBUTEDPLAN
 04:HASH JOIN [INNER JOIN, BROADCAST]
 |  hash predicates: month = b.month
@@ -35,12 +35,12 @@ where b.month = 1
 |--07:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypes]
-|     partitions=2/24 size=80.64KB
+|     partitions=2/24 size=40.32KB
 |
 06:MERGE
 |
 01:SCAN HDFS [functional.alltypes]
-   partitions=2/24 size=80.64KB
+   partitions=2/24 size=40.32KB
 ====
 // Only UNION ALL, no nested unions
 select * from functional.alltypestiny where year=2009 and month=1
@@ -52,13 +52,13 @@ select * from functional.alltypestiny where year=2009 and month=2
 00:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -72,17 +72,17 @@ NODE 3:
 |--07:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--06:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 05:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Only UNION ALL with limit inside operands. One of the operands also has an order by.
 select * from functional.alltypestiny where year=2009 and month=1 limit 1
@@ -94,7 +94,7 @@ select * from functional.alltypestiny where year=2009 and month=2 limit 1
 00:MERGE
 |
 |--04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |     limit: 1
 |
 |--03:TOP-N [LIMIT=1]
@@ -104,7 +104,7 @@ select * from functional.alltypestiny where year=2009 and month=2 limit 1
 |     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
    limit: 1
 ---- SCANRANGELOCATIONS
 NODE 1:
@@ -122,7 +122,7 @@ NODE 4:
 |  |  limit: 1
 |  |
 |  04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |     limit: 1
 |
 |--11:MERGE
@@ -144,7 +144,7 @@ NODE 4:
 |  limit: 1
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
    limit: 1
 ====
 // Only UNION DISTINCT, no nested unions
@@ -160,13 +160,13 @@ select * from functional.alltypestiny where year=2009 and month=2
 00:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -175,25 +175,36 @@ NODE 2:
 NODE 3:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-04:AGGREGATE [FINALIZE]
+13:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+12:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-05:EXCHANGE [PARTITION=UNPARTITIONED]
+11:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--08:MERGE
+|--10:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  08:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--07:MERGE
+|--09:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  07:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+04:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 06:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Only UNION ALL, mixed selects with and without from clauses, no nested unions
 select * from functional.alltypestiny where year=2009 and month=1
@@ -208,10 +219,10 @@ select 1,false,1,1,1,10,1.1,10.1,'01/01/09','1',cast('2009-01-01 00:01:00' as ti
 |  constant-selects=2
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -226,12 +237,12 @@ NODE 2:
 |--05:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 04:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Only UNION DISTINCT, mixed selects with and without from clauses, no nested unions
 select * from functional.alltypestiny where year=2009 and month=1
@@ -249,33 +260,44 @@ select 1,false,1,1,1,10,1.1,10.1,'01/01/09','1',cast('2009-01-01 00:01:00' as ti
 |  constant-selects=2
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
 NODE 2:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
 ---- DISTRIBUTEDPLAN
-03:AGGREGATE [FINALIZE]
+12:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+11:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-04:EXCHANGE [PARTITION=UNPARTITIONED]
+10:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--07:MERGE
+|--09:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  07:MERGE
 |     constant-selects=2
 |
-|--06:MERGE
+|--08:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  06:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+03:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 05:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Mixed UNION ALL/DISTINCT but effectively only UNION DISTINCT, no nested unions,
 // with order by and limit
@@ -297,16 +319,16 @@ order by 3 limit 3
 00:MERGE
 |
 |--04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -317,33 +339,50 @@ NODE 3:
 NODE 4:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
+18:TOP-N [LIMIT=3]
+|  order by: tinyint_col ASC
+|
+17:EXCHANGE [PARTITION=UNPARTITIONED]
+|
 06:TOP-N [LIMIT=3]
 |  order by: tinyint_col ASC
 |
-05:AGGREGATE [FINALIZE]
+16:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-07:EXCHANGE [PARTITION=UNPARTITIONED]
+15:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--11:MERGE
+|--14:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  11:MERGE
 |  |
 |  04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--10:MERGE
+|--13:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  10:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--09:MERGE
+|--12:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  09:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+05:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 08:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Mixed UNION ALL/DISTINCT, no nested unions, with order by and limit
 select * from functional.alltypestiny where year=2009 and month=1
@@ -366,16 +405,16 @@ order by 3,4 limit 3
 |  00:MERGE
 |  |
 |  |--02:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  01:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--06:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 05:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -386,37 +425,52 @@ NODE 5:
 NODE 6:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-07:TOP-N [LIMIT=3]
+21:TOP-N [LIMIT=3]
 |  order by: tinyint_col ASC, smallint_col ASC
 |
-11:EXCHANGE [PARTITION=UNPARTITIONED]
+20:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--14:MERGE
+|--19:TOP-N [LIMIT=3]
+|  |  order by: tinyint_col ASC, smallint_col ASC
 |  |
-|  03:AGGREGATE [FINALIZE]
+|  17:MERGE
+|  |
+|  13:AGGREGATE [MERGE FINALIZE]
 |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
-|  08:EXCHANGE [PARTITION=UNPARTITIONED]
+|  12:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |  |
-|  |--10:MERGE
+|  |--11:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  10:MERGE
 |  |  |
 |  |  02:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
+|  |
+|  03:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
 |  09:MERGE
 |  |
 |  01:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--13:MERGE
+|--18:TOP-N [LIMIT=3]
+|  |  order by: tinyint_col ASC, smallint_col ASC
+|  |
+|  16:MERGE
 |  |
 |  06:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-12:MERGE
+07:TOP-N [LIMIT=3]
+|  order by: tinyint_col ASC, smallint_col ASC
+|
+15:MERGE
 |
 05:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Mixed UNION ALL/DISTINCT, no nested unions, with order by and limit
 select * from functional.alltypestiny where year=2009 and month=1
@@ -439,16 +493,16 @@ order by 3,4 limit 4
 |  00:MERGE
 |  |
 |  |--03:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  |--02:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  01:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 06:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -459,37 +513,52 @@ NODE 3:
 NODE 6:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-07:TOP-N [LIMIT=4]
+21:TOP-N [LIMIT=4]
 |  order by: tinyint_col ASC, smallint_col ASC
 |
-12:EXCHANGE [PARTITION=UNPARTITIONED]
+20:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--14:MERGE
+|--19:TOP-N [LIMIT=4]
+|  |  order by: tinyint_col ASC, smallint_col ASC
 |  |
-|  04:AGGREGATE [FINALIZE]
+|  18:MERGE
+|  |
+|  15:AGGREGATE [MERGE FINALIZE]
 |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
-|  08:EXCHANGE [PARTITION=UNPARTITIONED]
+|  14:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |  |
-|  |--11:MERGE
+|  |--13:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  11:MERGE
 |  |  |
 |  |  03:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
-|  |--10:MERGE
+|  |--12:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  10:MERGE
 |  |  |
 |  |  02:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
+|  |
+|  04:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
 |  09:MERGE
 |  |
 |  01:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-13:MERGE
+07:TOP-N [LIMIT=4]
+|  order by: tinyint_col ASC, smallint_col ASC
+|
+17:MERGE
 |
 06:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: Only UNION ALL, first operand is nested
 (select * from functional.alltypestiny where year=2009 and month=1
@@ -501,13 +570,13 @@ select * from functional.alltypestiny where year=2009 and month=1
 00:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -521,17 +590,17 @@ NODE 3:
 |--07:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--06:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 05:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: Only UNION ALL, second operand is nested
 select * from functional.alltypestiny where year=2009 and month=1
@@ -543,13 +612,13 @@ union all
 00:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -563,17 +632,17 @@ NODE 3:
 |--07:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--06:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 05:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: Only UNION DISTINCT, first operand is nested
 (select * from functional.alltypestiny where year=2009 and month=1
@@ -588,13 +657,13 @@ select * from functional.alltypestiny where year=2009 and month=1
 00:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -603,25 +672,36 @@ NODE 2:
 NODE 3:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
 ---- DISTRIBUTEDPLAN
-04:AGGREGATE [FINALIZE]
+13:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+12:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-05:EXCHANGE [PARTITION=UNPARTITIONED]
+11:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--08:MERGE
+|--10:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  08:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--07:MERGE
+|--09:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  07:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+04:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 06:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: Only UNION DISTINCT, second operand is nested
 select * from functional.alltypestiny where year=2009 and month=1
@@ -636,13 +716,13 @@ union distinct
 00:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -651,25 +731,36 @@ NODE 2:
 NODE 3:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-04:AGGREGATE [FINALIZE]
+13:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+12:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-05:EXCHANGE [PARTITION=UNPARTITIONED]
+11:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--08:MERGE
+|--10:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  08:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--07:MERGE
+|--09:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  07:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+04:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 06:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION ALL doesn't absorb nested union with DISTINCT,
 // first operand is nested
@@ -682,7 +773,7 @@ select * from functional.alltypestiny where year=2009 and month=1
 00:MERGE
 |
 |--05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 04:AGGREGATE [FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
@@ -690,10 +781,10 @@ select * from functional.alltypestiny where year=2009 and month=1
 01:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 02:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 2:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -702,29 +793,35 @@ NODE 3:
 NODE 5:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
 ---- DISTRIBUTEDPLAN
-09:EXCHANGE [PARTITION=UNPARTITIONED]
+12:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--11:MERGE
+|--14:MERGE
 |  |
 |  05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-10:MERGE
+13:MERGE
 |
-04:AGGREGATE [FINALIZE]
+11:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-06:EXCHANGE [PARTITION=UNPARTITIONED]
+10:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--08:MERGE
+|--09:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  08:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+04:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 07:MERGE
 |
 02:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION ALL doesn't absorb nested union with DISTINCT,
 // second operand is nested
@@ -742,13 +839,13 @@ union all
 |  02:MERGE
 |  |
 |  |--04:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -757,29 +854,35 @@ NODE 3:
 NODE 4:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-09:EXCHANGE [PARTITION=UNPARTITIONED]
+12:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--11:MERGE
+|--14:MERGE
 |  |
-|  05:AGGREGATE [FINALIZE]
+|  11:AGGREGATE [MERGE FINALIZE]
 |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
-|  06:EXCHANGE [PARTITION=UNPARTITIONED]
+|  10:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |  |
-|  |--08:MERGE
+|  |--09:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  08:MERGE
 |  |  |
 |  |  04:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
+|  |
+|  05:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
 |  07:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-10:MERGE
+13:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION ALL absorbs the children but not directly the operands
 // of a nested union with mixed ALL/DISTINCT, first operand is nested
@@ -794,7 +897,7 @@ select * from functional.alltypestiny where year=2009 and month=1
 00:MERGE
 |
 |--06:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--05:AGGREGATE [FINALIZE]
 |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
@@ -802,13 +905,13 @@ select * from functional.alltypestiny where year=2009 and month=1
 |  02:MERGE
 |  |
 |  |--04:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
@@ -819,34 +922,40 @@ NODE 4:
 NODE 6:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
 ---- DISTRIBUTEDPLAN
-10:EXCHANGE [PARTITION=UNPARTITIONED]
+13:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--13:MERGE
+|--16:MERGE
 |  |
 |  06:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--12:MERGE
+|--15:MERGE
 |  |
-|  05:AGGREGATE [FINALIZE]
+|  12:AGGREGATE [MERGE FINALIZE]
 |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
-|  07:EXCHANGE [PARTITION=UNPARTITIONED]
+|  11:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |  |
-|  |--09:MERGE
+|  |--10:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  09:MERGE
 |  |  |
 |  |  04:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
+|  |
+|  05:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
 |  08:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-11:MERGE
+14:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION ALL absorbs the children but not directly the operands
 // of a nested union with mixed ALL/DISTINCT, second operand is nested
@@ -866,16 +975,16 @@ union all
 |  03:MERGE
 |  |
 |  |--05:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -886,34 +995,40 @@ NODE 4:
 NODE 5:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-10:EXCHANGE [PARTITION=UNPARTITIONED]
+13:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--13:MERGE
+|--16:MERGE
 |  |
-|  06:AGGREGATE [FINALIZE]
+|  12:AGGREGATE [MERGE FINALIZE]
 |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
-|  07:EXCHANGE [PARTITION=UNPARTITIONED]
+|  11:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |  |
-|  |--09:MERGE
+|  |--10:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  09:MERGE
 |  |  |
 |  |  05:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
+|  |
+|  06:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
 |  08:MERGE
 |  |
 |  04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--12:MERGE
+|--15:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-11:MERGE
+14:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION ALL doesn't absorb the children of a nested union
 // with mixed ALL/DISTINCT and limit, second operand is nested
@@ -937,16 +1052,16 @@ union all
 |  |  02:MERGE
 |  |  |
 |  |  |--04:SCAN HDFS [functional.alltypestiny]
-|  |  |     partitions=1/4 size=230B
+|  |  |     partitions=1/4 size=115B
 |  |  |
 |  |  03:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  07:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -957,41 +1072,47 @@ NODE 4:
 NODE 7:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-14:EXCHANGE [PARTITION=UNPARTITIONED]
+17:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--16:MERGE
+|--19:MERGE
 |  |
-|  11:EXCHANGE [PARTITION=UNPARTITIONED]
+|  14:EXCHANGE [PARTITION=UNPARTITIONED]
 |  |  limit: 10
 |  |
-|  |--13:MERGE
+|  |--16:MERGE
 |  |  |  limit: 10
 |  |  |
-|  |  05:AGGREGATE [FINALIZE]
+|  |  13:AGGREGATE [MERGE FINALIZE]
 |  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |  |
-|  |  08:EXCHANGE [PARTITION=UNPARTITIONED]
+|  |  12:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |  |  |
-|  |  |--10:MERGE
+|  |  |--11:AGGREGATE
+|  |  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |  |
+|  |  |  10:MERGE
 |  |  |  |
 |  |  |  04:SCAN HDFS [functional.alltypestiny]
-|  |  |     partitions=1/4 size=230B
+|  |  |     partitions=1/4 size=115B
+|  |  |
+|  |  05:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |  |
 |  |  09:MERGE
 |  |  |
 |  |  03:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
-|  12:MERGE
+|  15:MERGE
 |  |  limit: 10
 |  |
 |  07:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-15:MERGE
+18:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION ALL doesn't absorb nested union with order by and limit,
 // first operand is nested
@@ -1005,7 +1126,7 @@ select * from functional.alltypestiny where year=2009 and month=1
 00:MERGE
 |
 |--05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 04:TOP-N [LIMIT=3]
 |  order by: tinyint_col ASC
@@ -1013,10 +1134,10 @@ select * from functional.alltypestiny where year=2009 and month=1
 01:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 02:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 2:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1025,29 +1146,35 @@ NODE 3:
 NODE 5:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
 ---- DISTRIBUTEDPLAN
-09:EXCHANGE [PARTITION=UNPARTITIONED]
+12:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--11:MERGE
+|--14:MERGE
 |  |
 |  05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-10:MERGE
+13:MERGE
+|
+11:TOP-N [LIMIT=3]
+|  order by: tinyint_col ASC
+|
+10:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+|--09:TOP-N [LIMIT=3]
+|  |  order by: tinyint_col ASC
+|  |
+|  08:MERGE
+|  |
+|  03:SCAN HDFS [functional.alltypestiny]
+|     partitions=1/4 size=115B
 |
 04:TOP-N [LIMIT=3]
 |  order by: tinyint_col ASC
 |
-06:EXCHANGE [PARTITION=UNPARTITIONED]
-|
-|--08:MERGE
-|  |
-|  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
-|
 07:MERGE
 |
 02:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION ALL doesn't absorb nested union with order by and limit,
 // second operand is nested
@@ -1066,13 +1193,13 @@ union all
 |  02:MERGE
 |  |
 |  |--04:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1081,29 +1208,35 @@ NODE 3:
 NODE 4:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-09:EXCHANGE [PARTITION=UNPARTITIONED]
+12:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--11:MERGE
+|--14:MERGE
+|  |
+|  11:TOP-N [LIMIT=3]
+|  |  order by: tinyint_col ASC
+|  |
+|  10:EXCHANGE [PARTITION=UNPARTITIONED]
+|  |
+|  |--09:TOP-N [LIMIT=3]
+|  |  |  order by: tinyint_col ASC
+|  |  |
+|  |  08:MERGE
+|  |  |
+|  |  04:SCAN HDFS [functional.alltypestiny]
+|  |     partitions=1/4 size=115B
 |  |
 |  05:TOP-N [LIMIT=3]
 |  |  order by: tinyint_col ASC
 |  |
-|  06:EXCHANGE [PARTITION=UNPARTITIONED]
-|  |
-|  |--08:MERGE
-|  |  |
-|  |  04:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
-|  |
 |  07:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-10:MERGE
+13:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION DISTINCT absorbs nested union with ALL
 // first operand is nested
@@ -1119,13 +1252,13 @@ select * from functional.alltypestiny where year=2009 and month=1
 00:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1134,25 +1267,36 @@ NODE 2:
 NODE 3:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
 ---- DISTRIBUTEDPLAN
-04:AGGREGATE [FINALIZE]
+13:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+12:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-05:EXCHANGE [PARTITION=UNPARTITIONED]
+11:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--08:MERGE
+|--10:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  08:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--07:MERGE
+|--09:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  07:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+04:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 06:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION DISTINCT absorbs nested union with ALL,
 // second operand is nested
@@ -1168,13 +1312,13 @@ union distinct
 00:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1183,25 +1327,36 @@ NODE 2:
 NODE 3:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-04:AGGREGATE [FINALIZE]
+13:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+12:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-05:EXCHANGE [PARTITION=UNPARTITIONED]
+11:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--08:MERGE
+|--10:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  08:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--07:MERGE
+|--09:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  07:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+04:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 06:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION DISTINCT absorbs nested union with mixed ALL/DISTINCT,
 // first operand is nested
@@ -1219,16 +1374,16 @@ select * from functional.alltypestiny where year=2009 and month=1
 00:MERGE
 |
 |--04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1239,30 +1394,44 @@ NODE 3:
 NODE 4:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
 ---- DISTRIBUTEDPLAN
-05:AGGREGATE [FINALIZE]
+16:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+15:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-06:EXCHANGE [PARTITION=UNPARTITIONED]
+14:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--10:MERGE
+|--13:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  10:MERGE
 |  |
 |  04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--09:MERGE
+|--12:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  09:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--08:MERGE
+|--11:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  08:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+05:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 07:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION DISTINCT absorbs nested union with mixed ALL/DISTINCT,
 // second operand is nested
@@ -1280,16 +1449,16 @@ union distinct
 00:MERGE
 |
 |--04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1300,30 +1469,44 @@ NODE 3:
 NODE 4:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-05:AGGREGATE [FINALIZE]
+16:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+15:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-06:EXCHANGE [PARTITION=UNPARTITIONED]
+14:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--10:MERGE
+|--13:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  10:MERGE
 |  |
 |  04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--09:MERGE
+|--12:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  09:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--08:MERGE
+|--11:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  08:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+05:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 07:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION DISTINCT doesn't absorb nested union with order by and limit,
 // first operand is nested
@@ -1340,7 +1523,7 @@ select * from functional.alltypestiny where year=2009 and month=1
 00:MERGE
 |
 |--05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 04:TOP-N [LIMIT=3]
 |  order by: tinyint_col ASC
@@ -1348,10 +1531,10 @@ select * from functional.alltypestiny where year=2009 and month=1
 01:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 02:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 2:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1360,32 +1543,46 @@ NODE 3:
 NODE 5:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
 ---- DISTRIBUTEDPLAN
-06:AGGREGATE [FINALIZE]
+19:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+18:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-10:EXCHANGE [PARTITION=UNPARTITIONED]
+17:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--12:MERGE
+|--16:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  15:MERGE
 |  |
 |  05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-11:MERGE
+06:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|
+14:MERGE
+|
+12:TOP-N [LIMIT=3]
+|  order by: tinyint_col ASC
+|
+11:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+|--10:TOP-N [LIMIT=3]
+|  |  order by: tinyint_col ASC
+|  |
+|  09:MERGE
+|  |
+|  03:SCAN HDFS [functional.alltypestiny]
+|     partitions=1/4 size=115B
 |
 04:TOP-N [LIMIT=3]
 |  order by: tinyint_col ASC
 |
-07:EXCHANGE [PARTITION=UNPARTITIONED]
-|
-|--09:MERGE
-|  |
-|  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
-|
 08:MERGE
 |
 02:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Union unnesting: UNION DISTINCT doesn't absorb nested union with order by and limit
 // second operand is nested
@@ -1407,13 +1604,13 @@ union distinct
 |  02:MERGE
 |  |
 |  |--04:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1422,32 +1619,46 @@ NODE 3:
 NODE 4:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-06:AGGREGATE [FINALIZE]
+19:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+18:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-10:EXCHANGE [PARTITION=UNPARTITIONED]
+17:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--12:MERGE
+|--16:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  15:MERGE
+|  |
+|  12:TOP-N [LIMIT=3]
+|  |  order by: tinyint_col ASC
+|  |
+|  11:EXCHANGE [PARTITION=UNPARTITIONED]
+|  |
+|  |--10:TOP-N [LIMIT=3]
+|  |  |  order by: tinyint_col ASC
+|  |  |
+|  |  09:MERGE
+|  |  |
+|  |  04:SCAN HDFS [functional.alltypestiny]
+|  |     partitions=1/4 size=115B
 |  |
 |  05:TOP-N [LIMIT=3]
 |  |  order by: tinyint_col ASC
 |  |
-|  07:EXCHANGE [PARTITION=UNPARTITIONED]
-|  |
-|  |--09:MERGE
-|  |  |
-|  |  04:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
-|  |
 |  08:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-11:MERGE
+06:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|
+14:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Complex union unnesting: Multiple levels of UNION ALL, fully unnestable
 select * from functional.alltypestiny where year=2009 and month=1
@@ -1463,19 +1674,19 @@ union all
 00:MERGE
 |
 |--05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1493,27 +1704,27 @@ NODE 5:
 |--11:MERGE
 |  |
 |  05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--10:MERGE
 |  |
 |  04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--09:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--08:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 07:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Complex union unnesting: Multiple levels of UNION DISTINCT, fully unnestable
 select * from functional.alltypestiny where year=2009 and month=1
@@ -1532,19 +1743,19 @@ union distinct
 00:MERGE
 |
 |--05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1557,35 +1768,52 @@ NODE 4:
 NODE 5:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=3/090301.txt 0:115
 ---- DISTRIBUTEDPLAN
-06:AGGREGATE [FINALIZE]
+19:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+18:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-07:EXCHANGE [PARTITION=UNPARTITIONED]
+17:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--12:MERGE
+|--16:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  12:MERGE
 |  |
 |  05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--11:MERGE
+|--15:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  11:MERGE
 |  |
 |  04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--10:MERGE
+|--14:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  10:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--09:MERGE
+|--13:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  09:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+06:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 08:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Complex union unnesting: Partially unnestable up to 2nd level
 select * from functional.alltypestiny where year=2009 and month=1
@@ -1615,19 +1843,19 @@ union all
 |  |  05:MERGE
 |  |  |
 |  |  |--07:SCAN HDFS [functional.alltypestiny]
-|  |  |     partitions=1/4 size=230B
+|  |  |     partitions=1/4 size=115B
 |  |  |
 |  |  06:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  |--04:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1640,49 +1868,69 @@ NODE 6:
 NODE 7:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=3/090301.txt 0:115
 ---- DISTRIBUTEDPLAN
-18:EXCHANGE [PARTITION=UNPARTITIONED]
+27:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--20:MERGE
+|--29:MERGE
 |  |
-|  10:AGGREGATE [FINALIZE]
+|  26:AGGREGATE [MERGE FINALIZE]
 |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
-|  14:EXCHANGE [PARTITION=UNPARTITIONED]
+|  25:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |  |
-|  |--17:MERGE
+|  |--24:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  22:MERGE
+|  |  |
+|  |  18:TOP-N [LIMIT=3]
+|  |  |  order by: tinyint_col ASC
+|  |  |
+|  |  17:EXCHANGE [PARTITION=UNPARTITIONED]
 |  |  |
 |  |  09:TOP-N [LIMIT=3]
 |  |  |  order by: tinyint_col ASC
 |  |  |
-|  |  08:AGGREGATE [FINALIZE]
+|  |  16:AGGREGATE [MERGE FINALIZE]
 |  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |  |
-|  |  11:EXCHANGE [PARTITION=UNPARTITIONED]
+|  |  15:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |  |  |
-|  |  |--13:MERGE
+|  |  |--14:AGGREGATE
+|  |  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |  |
+|  |  |  13:MERGE
 |  |  |  |
 |  |  |  07:SCAN HDFS [functional.alltypestiny]
-|  |  |     partitions=1/4 size=230B
+|  |  |     partitions=1/4 size=115B
+|  |  |
+|  |  08:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |  |
 |  |  12:MERGE
 |  |  |
 |  |  06:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
-|  |--16:MERGE
+|  |--23:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  21:MERGE
 |  |  |
 |  |  04:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
-|  15:MERGE
+|  10:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  20:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-19:MERGE
+28:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Complex union unnesting: Partially unnestable up to 1st level
 select * from functional.alltypestiny where year=2009 and month=1
@@ -1710,19 +1958,19 @@ union distinct
 |  04:MERGE
 |  |
 |  |--06:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1735,45 +1983,70 @@ NODE 5:
 NODE 6:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=3/090301.txt 0:115
 ---- DISTRIBUTEDPLAN
-09:AGGREGATE [FINALIZE]
+28:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+27:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-13:EXCHANGE [PARTITION=UNPARTITIONED]
+26:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--17:MERGE
+|--25:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  22:MERGE
+|  |
+|  17:TOP-N [LIMIT=3]
+|  |  order by: tinyint_col ASC
+|  |
+|  16:EXCHANGE [PARTITION=UNPARTITIONED]
 |  |
 |  08:TOP-N [LIMIT=3]
 |  |  order by: tinyint_col ASC
 |  |
-|  07:AGGREGATE [FINALIZE]
+|  15:AGGREGATE [MERGE FINALIZE]
 |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
-|  10:EXCHANGE [PARTITION=UNPARTITIONED]
+|  14:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |  |
-|  |--12:MERGE
+|  |--13:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  12:MERGE
 |  |  |
 |  |  06:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
+|  |
+|  07:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
 |  11:MERGE
 |  |
 |  05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--16:MERGE
+|--24:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  21:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--15:MERGE
+|--23:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  20:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-14:MERGE
+09:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|
+19:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // Complex union unnesting: Multiple nested unions to test all rules in a single query
 select * from functional.alltypestiny where year=2009 and month=1
@@ -1809,19 +2082,19 @@ union all
 |  |  04:MERGE
 |  |  |
 |  |  |--06:SCAN HDFS [functional.alltypestiny]
-|  |  |     partitions=1/4 size=230B
+|  |  |     partitions=1/4 size=115B
 |  |  |
 |  |  05:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  |--03:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  |--02:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
 |  01:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--15:TOP-N [LIMIT=3]
 |  |  order by: tinyint_col ASC
@@ -1832,13 +2105,13 @@ union all
 |  |     partitions=0/4 size=0B
 |  |
 |  13:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 |--11:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 10:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 1:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1858,73 +2131,97 @@ NODE 13:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=4/090401.txt 0:115
 NODE 14:
 ---- DISTRIBUTEDPLAN
-27:EXCHANGE [PARTITION=UNPARTITIONED]
+38:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--31:MERGE
+|--42:MERGE
 |  |
-|  08:AGGREGATE [FINALIZE]
+|  37:AGGREGATE [MERGE FINALIZE]
 |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |  |
-|  22:EXCHANGE [PARTITION=UNPARTITIONED]
+|  36:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |  |
-|  |--26:MERGE
+|  |--35:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  32:MERGE
+|  |  |
+|  |  27:TOP-N [LIMIT=3]
+|  |  |  order by: tinyint_col ASC
+|  |  |
+|  |  26:EXCHANGE [PARTITION=UNPARTITIONED]
+|  |  |
+|  |  |--25:TOP-N [LIMIT=3]
+|  |  |  |  order by: tinyint_col ASC
+|  |  |  |
+|  |  |  24:MERGE
+|  |  |  |
+|  |  |  06:SCAN HDFS [functional.alltypestiny]
+|  |  |     partitions=1/4 size=115B
 |  |  |
 |  |  07:TOP-N [LIMIT=3]
 |  |  |  order by: tinyint_col ASC
 |  |  |
-|  |  19:EXCHANGE [PARTITION=UNPARTITIONED]
-|  |  |
-|  |  |--21:MERGE
-|  |  |  |
-|  |  |  06:SCAN HDFS [functional.alltypestiny]
-|  |  |     partitions=1/4 size=230B
-|  |  |
-|  |  20:MERGE
+|  |  23:MERGE
 |  |  |
 |  |  05:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
-|  |--25:MERGE
+|  |--34:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  31:MERGE
 |  |  |
 |  |  03:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
-|  |--24:MERGE
+|  |--33:AGGREGATE
+|  |  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |  |
+|  |  30:MERGE
 |  |  |
 |  |  02:SCAN HDFS [functional.alltypestiny]
-|  |     partitions=1/4 size=230B
+|  |     partitions=1/4 size=115B
 |  |
-|  23:MERGE
+|  08:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  29:MERGE
 |  |
 |  01:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--30:MERGE
+|--41:MERGE
 |  |
-|  15:TOP-N [LIMIT=3]
+|  21:TOP-N [LIMIT=3]
 |  |  order by: tinyint_col ASC
 |  |
-|  16:EXCHANGE [PARTITION=UNPARTITIONED]
+|  20:EXCHANGE [PARTITION=UNPARTITIONED]
 |  |
-|  |--18:MERGE
+|  |--19:TOP-N [LIMIT=3]
+|  |  |  order by: tinyint_col ASC
+|  |  |
+|  |  18:MERGE
 |  |  |
 |  |  14:SCAN HDFS [functional.alltypestiny]
 |  |     partitions=0/4 size=0B
 |  |
+|  15:TOP-N [LIMIT=3]
+|  |  order by: tinyint_col ASC
+|  |
 |  17:MERGE
 |  |
 |  13:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-|--29:MERGE
+|--40:MERGE
 |  |
 |  11:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-28:MERGE
+39:MERGE
 |
 10:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // UNION ALL in subquery
 select x.* from
@@ -1941,15 +2238,15 @@ order by 3 limit 5
 00:MERGE
 |
 |--04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 01:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 02:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 2:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -1958,15 +2255,21 @@ NODE 3:
 NODE 4:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
-05:TOP-N [LIMIT=5]
+14:TOP-N [LIMIT=5]
 |  order by: tinyint_col ASC
 |
-09:EXCHANGE [PARTITION=UNPARTITIONED]
+13:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--11:MERGE
+|--12:TOP-N [LIMIT=5]
+|  |  order by: tinyint_col ASC
+|  |
+|  11:MERGE
 |  |
 |  04:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+05:TOP-N [LIMIT=5]
+|  order by: tinyint_col ASC
 |
 10:MERGE
 |
@@ -1975,12 +2278,12 @@ NODE 4:
 |--08:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 07:MERGE
 |
 02:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // UNION DISTINCT in subquery
 select x.* from
@@ -2000,7 +2303,7 @@ order by 3 limit 3
 00:MERGE
 |
 |--05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 04:AGGREGATE [FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
@@ -2008,10 +2311,10 @@ order by 3 limit 3
 01:MERGE
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 02:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ---- SCANRANGELOCATIONS
 NODE 2:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=1/090101.txt 0:115
@@ -2020,35 +2323,52 @@ NODE 3:
 NODE 5:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypestiny/year=2009/month=2/090201.txt 0:115
 ---- DISTRIBUTEDPLAN
+21:TOP-N [LIMIT=3]
+|  order by: tinyint_col ASC
+|
+20:EXCHANGE [PARTITION=UNPARTITIONED]
+|
 07:TOP-N [LIMIT=3]
 |  order by: tinyint_col ASC
 |
-06:AGGREGATE [FINALIZE]
+19:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-11:EXCHANGE [PARTITION=UNPARTITIONED]
+18:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--13:MERGE
+|--17:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  16:MERGE
 |  |
 |  05:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
-12:MERGE
-|
-04:AGGREGATE [FINALIZE]
+06:AGGREGATE
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-08:EXCHANGE [PARTITION=UNPARTITIONED]
+15:MERGE
 |
-|--10:MERGE
+13:AGGREGATE [MERGE FINALIZE]
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|
+12:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
+|
+|--11:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  10:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+04:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 09:MERGE
 |
 02:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
+   partitions=1/4 size=115B
 ====
 // UNION ALL in subquery with a WHERE condition in the outer select.
 select x.* from
@@ -2062,7 +2382,7 @@ where x.int_col < 5 and x.bool_col = false
 00:MERGE
 |
 |--04:AGGREGATE [FINALIZE]
-|  |  output: COUNT(*)
+|  |  output: count(*)
 |  |  group by: int_col, bool_col
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
@@ -2070,7 +2390,7 @@ where x.int_col < 5 and x.bool_col = false
 |     predicates: functional.alltypestiny.int_col < 5, functional.alltypestiny.bool_col = FALSE
 |
 02:AGGREGATE [FINALIZE]
-|  output: COUNT(*)
+|  output: count(*)
 |  group by: int_col, bool_col
 |
 01:SCAN HDFS [functional.alltypestiny]
@@ -2087,13 +2407,13 @@ NODE 3:
 |--11:MERGE
 |  |
 |  08:AGGREGATE [MERGE FINALIZE]
-|  |  output: SUM(COUNT(*))
+|  |  output: sum(count(*))
 |  |  group by: int_col, bool_col
 |  |
 |  07:EXCHANGE [PARTITION=HASH(int_col,bool_col)]
 |  |
 |  04:AGGREGATE
-|  |  output: COUNT(*)
+|  |  output: count(*)
 |  |  group by: int_col, bool_col
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
@@ -2103,13 +2423,13 @@ NODE 3:
 10:MERGE
 |
 06:AGGREGATE [MERGE FINALIZE]
-|  output: SUM(COUNT(*))
+|  output: sum(count(*))
 |  group by: int_col, bool_col
 |
 05:EXCHANGE [PARTITION=HASH(int_col,bool_col)]
 |
 02:AGGREGATE
-|  output: COUNT(*)
+|  output: count(*)
 |  group by: int_col, bool_col
 |
 01:SCAN HDFS [functional.alltypestiny]
@@ -2166,32 +2486,38 @@ select int_col, string_col, bool_col, float_col from functional.alltypestiny
 |  |  constant-selects=2
 |  |
 |  01:SCAN HDFS [functional.alltypestiny]
-|     partitions=4/4 size=920B
+|     partitions=4/4 size=460B
 |
 04:SCAN HDFS [functional.alltypestiny]
-   partitions=4/4 size=920B
+   partitions=4/4 size=460B
 ---- DISTRIBUTEDPLAN
-08:EXCHANGE [PARTITION=UNPARTITIONED]
+11:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--10:MERGE
+|--13:MERGE
 |  |
-|  02:AGGREGATE [FINALIZE]
+|  10:AGGREGATE [MERGE FINALIZE]
 |  |  group by: 1, 'a', null, f
 |  |
-|  05:EXCHANGE [PARTITION=UNPARTITIONED]
+|  09:EXCHANGE [PARTITION=HASH(1,'a',null,f)]
 |  |
-|  |--07:MERGE
+|  |--08:AGGREGATE
+|  |  |  group by: 1, 'a', null, f
+|  |  |
+|  |  07:MERGE
 |  |     constant-selects=2
+|  |
+|  02:AGGREGATE
+|  |  group by: 1, 'a', null, f
 |  |
 |  06:MERGE
 |  |
 |  01:SCAN HDFS [functional.alltypestiny]
-|     partitions=4/4 size=920B
+|     partitions=4/4 size=460B
 |
-09:MERGE
+12:MERGE
 |
 04:SCAN HDFS [functional.alltypestiny]
-   partitions=4/4 size=920B
+   partitions=4/4 size=460B
 ====
 // UNION ALL/DISTINCT with mixed constant selects and non-constant selects and nested unions
 (select 500
@@ -2216,7 +2542,7 @@ select 503
 |  constant-selects=2
 |
 |--03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
 |
 02:TOP-N [LIMIT=3]
 |  order by: int_col ASC
@@ -2224,25 +2550,34 @@ select 503
 01:SCAN HDFS [functional.alltypestiny]
    partitions=1/4 size=115B
 ---- DISTRIBUTEDPLAN
-12:EXCHANGE [PARTITION=UNPARTITIONED]
+16:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--14:MERGE
+|--18:MERGE
 |     constant-selects=1
 |
-13:MERGE
+17:MERGE
 |
-04:AGGREGATE [FINALIZE]
+15:AGGREGATE [MERGE FINALIZE]
 |  group by: 500
 |
-08:EXCHANGE [PARTITION=UNPARTITIONED]
+14:EXCHANGE [PARTITION=HASH(500)]
 |
-|--11:MERGE
+|--13:AGGREGATE
+|  |  group by: 500
+|  |
+|  11:MERGE
 |     constant-selects=2
 |
-|--10:MERGE
+|--12:AGGREGATE
+|  |  group by: 500
+|  |
+|  10:MERGE
 |  |
 |  03:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
+|     partitions=1/4 size=115B
+|
+04:AGGREGATE
+|  group by: 500
 |
 09:MERGE
 |
@@ -2307,32 +2642,38 @@ select int_col, string_col, bool_col, float_col from functional.alltypessmall
 |  |  constant-selects=2
 |  |
 |  01:SCAN HDFS [functional.alltypestiny]
-|     partitions=4/4 size=920B
+|     partitions=4/4 size=460B
 |
 04:SCAN HDFS [functional.alltypessmall]
-   partitions=4/4 size=12.64KB
+   partitions=4/4 size=6.32KB
 ---- DISTRIBUTEDPLAN
-08:EXCHANGE [PARTITION=UNPARTITIONED]
+11:EXCHANGE [PARTITION=UNPARTITIONED]
 |
-|--10:MERGE
+|--13:MERGE
 |  |
-|  02:AGGREGATE [FINALIZE]
+|  10:AGGREGATE [MERGE FINALIZE]
 |  |  group by: 1, 'a', null, f
 |  |
-|  05:EXCHANGE [PARTITION=UNPARTITIONED]
+|  09:EXCHANGE [PARTITION=HASH(1,'a',null,f)]
 |  |
-|  |--07:MERGE
+|  |--08:AGGREGATE
+|  |  |  group by: 1, 'a', null, f
+|  |  |
+|  |  07:MERGE
 |  |     constant-selects=2
+|  |
+|  02:AGGREGATE
+|  |  group by: 1, 'a', null, f
 |  |
 |  06:MERGE
 |  |
 |  01:SCAN HDFS [functional.alltypestiny]
-|     partitions=4/4 size=920B
+|     partitions=4/4 size=460B
 |
-09:MERGE
+12:MERGE
 |
 04:SCAN HDFS [functional.alltypessmall]
-   partitions=4/4 size=12.64KB
+   partitions=4/4 size=6.32KB
 ====
 # all union output slots are being materialized even though none is referenced by
 # the enclosing scope
@@ -2356,7 +2697,7 @@ select count(*) from (
 ) x
 ---- PLAN
 04:AGGREGATE [FINALIZE]
-|  output: COUNT(*)
+|  output: count(*)
 |
 03:AGGREGATE [FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
@@ -2365,31 +2706,45 @@ select count(*) from (
 |  constant-selects=3
 |
 |--02:SCAN HDFS [functional.alltypes]
-|     partitions=24/24 size=956.90KB
+|     partitions=24/24 size=478.45KB
 |
 01:SCAN HDFS [functional.alltypes]
-   partitions=24/24 size=956.90KB
+   partitions=24/24 size=478.45KB
 ---- DISTRIBUTEDPLAN
-04:AGGREGATE [FINALIZE]
-|  output: COUNT(*)
+14:AGGREGATE [MERGE FINALIZE]
+|  output: sum(count(*))
 |
-03:AGGREGATE [FINALIZE]
+13:EXCHANGE [PARTITION=UNPARTITIONED]
+|
+04:AGGREGATE
+|  output: count(*)
+|
+12:AGGREGATE [MERGE FINALIZE]
 |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
-05:EXCHANGE [PARTITION=UNPARTITIONED]
+11:EXCHANGE [PARTITION=HASH(id,bool_col,tinyint_col,smallint_col,int_col,bigint_col,float_col,double_col,date_string_col,string_col,timestamp_col,year,month)]
 |
-|--08:MERGE
+|--10:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  08:MERGE
 |     constant-selects=3
 |
-|--07:MERGE
+|--09:AGGREGATE
+|  |  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
+|  |
+|  07:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypes]
-|     partitions=24/24 size=956.90KB
+|     partitions=24/24 size=478.45KB
+|
+03:AGGREGATE
+|  group by: id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month
 |
 06:MERGE
 |
 01:SCAN HDFS [functional.alltypes]
-   partitions=24/24 size=956.90KB
+   partitions=24/24 size=478.45KB
 ====
 // UNION ALL in subquery with a WHERE condition in the outer select;
 // Where clause conjuncts are used as scan predicates and for partition pruning.
@@ -2402,24 +2757,24 @@ where x.int_col < 5 and x.bool_col = false and x.month = 1
 00:MERGE
 |
 |--02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
-|     predicates: functional.alltypestiny.bool_col = FALSE, functional.alltypestiny.int_col < 5
+|     partitions=1/4 size=115B
+|     predicates: functional.alltypestiny.int_col < 5, functional.alltypestiny.bool_col = FALSE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
-   predicates: functional.alltypestiny.bool_col = FALSE, functional.alltypestiny.int_col < 5
+   partitions=1/4 size=115B
+   predicates: functional.alltypestiny.int_col < 5, functional.alltypestiny.bool_col = FALSE
 ---- DISTRIBUTEDPLAN
 03:EXCHANGE [PARTITION=UNPARTITIONED]
 |
 |--05:MERGE
 |  |
 |  02:SCAN HDFS [functional.alltypestiny]
-|     partitions=1/4 size=230B
-|     predicates: functional.alltypestiny.bool_col = FALSE, functional.alltypestiny.int_col < 5
+|     partitions=1/4 size=115B
+|     predicates: functional.alltypestiny.int_col < 5, functional.alltypestiny.bool_col = FALSE
 |
 04:MERGE
 |
 01:SCAN HDFS [functional.alltypestiny]
-   partitions=1/4 size=230B
-   predicates: functional.alltypestiny.bool_col = FALSE, functional.alltypestiny.int_col < 5
+   partitions=1/4 size=115B
+   predicates: functional.alltypestiny.int_col < 5, functional.alltypestiny.bool_col = FALSE
 ====

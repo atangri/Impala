@@ -20,8 +20,8 @@
 #include <vector>
 
 #include "common/status.h"
-#include "gen-cpp/Opcodes_types.h"
 #include "runtime/descriptors.h"
+#include "runtime/lib-cache.h"
 #include "runtime/raw-value.h"
 #include "runtime/tuple.h"
 #include "runtime/tuple-row.h"
@@ -91,10 +91,6 @@ struct ExprValue {
       string_val(const_cast<char*>(string_data.data()), string_data.size()) {
   }
 
-  // Update this ExprValue by parsing the string and return a pointer to the result.
-  // NULL will be returned if the string and type are not compatible.
-  void* TryParse(const std::string& string, PrimitiveType type);
-
   // Set string value to copy of str
   void SetStringVal(const StringValue& str) {
     string_data = std::string(str.ptr, str.len);
@@ -124,8 +120,8 @@ struct ExprValue {
   template<typename T> void* Get();
 
   // Sets the value for type to '0' and returns a pointer to the data
-  void* SetToZero(PrimitiveType type) {
-    switch (type) {
+  void* SetToZero(const ColumnType& type) {
+    switch (type.type) {
       case TYPE_NULL:
         return NULL;
       case TYPE_BOOLEAN:
@@ -156,8 +152,8 @@ struct ExprValue {
   }
 
   // Sets the value for type to min and returns a pointer to the data
-  void* SetToMin(PrimitiveType type) {
-    switch (type) {
+  void* SetToMin(const ColumnType& type) {
+    switch (type.type) {
       case TYPE_NULL:
         return NULL;
       case TYPE_BOOLEAN:
@@ -176,10 +172,12 @@ struct ExprValue {
         bigint_val = std::numeric_limits<int64_t>::min();
         return &bigint_val;
       case TYPE_FLOAT:
-        float_val = std::numeric_limits<float>::min();
+        // For floats and doubles, numeric_limits::min() is the smallest positive
+        // representable value.
+        float_val = -std::numeric_limits<float>::max();
         return &float_val;
       case TYPE_DOUBLE:
-        double_val = std::numeric_limits<double>::min();
+        double_val = -std::numeric_limits<double>::max();
         return &double_val;
       default:
         DCHECK(false);
@@ -188,8 +186,8 @@ struct ExprValue {
   }
 
   // Sets the value for type to max and returns a pointer to the data
-  void* SetToMax(PrimitiveType type) {
-    switch (type) {
+  void* SetToMax(const ColumnType& type) {
+    switch (type.type) {
       case TYPE_NULL:
         return NULL;
       case TYPE_BOOLEAN:
@@ -237,8 +235,7 @@ class Expr {
   // typedef for compute functions.
   typedef void* (*ComputeFn)(Expr*, TupleRow*);
 
-  // Empty virtual destructor
-  virtual ~Expr() {}
+  virtual ~Expr();
 
   // Evaluate expr and return pointer to result. The result is
   // valid as long as 'row' doesn't change.
@@ -287,10 +284,9 @@ class Expr {
   Expr* GetChild(int i) const { return children_[i]; }
   int GetNumChildren() const { return children_.size(); }
 
-  PrimitiveType type() const { return type_.type; }
-  const std::vector<Expr*>& children() const { return children_; }
+  const ColumnType& type() const { return type_; }
 
-  TExprOpcode::type op() const { return opcode_; }
+  const std::vector<Expr*>& children() const { return children_; }
 
   // Returns true if expr doesn't contain slotrefs, ie, can be evaluated
   // with GetValue(NULL). The default implementation returns true if all of
@@ -327,8 +323,22 @@ class Expr {
                         const RowDescriptor& row_desc, bool disable_codegen = true,
                         bool* thread_safe = NULL);
 
+  // Must be called after calling Prepare(). Subclasses overriding this function should
+  // call Expr::Open() to recursively call Open() on the expr tree.
+  virtual Status Open(RuntimeState* state);
+
+  // Calls Open() on every expr tree in 'exprs'.
+  static Status Open(const std::vector<Expr*>& exprs, RuntimeState* state);
+
+  // Must be called for each root expr. Subclasses overriding this function should call
+  // Expr::Close().
+  virtual void Close(RuntimeState* state);
+
+  // Calls Close() on every expr tree in 'exprs'.
+  static void Close(const std::vector<Expr*>& exprs, RuntimeState* state);
+
   // Create a new literal expr of 'type' with initial 'data'.
-  // data should match the PrimitiveType (i.e. type == TYPE_INT, data is a int*)
+  // data should match the ColumnType (i.e. type == TYPE_INT, data is a int*)
   // The new Expr will be allocated from the pool.
   static Expr* CreateLiteral(ObjectPool* pool, const ColumnType& type, void* data);
 
@@ -395,12 +405,27 @@ class Expr {
   // Returns the llvm return type for this expr
   llvm::Type* GetLlvmReturnType(LlvmCodeGen* codegen) const;
 
+  // If this expr is constant, evaluates the expr with no input row argument and returns
+  // the output. Returns NULL if the argument is not constant. The returned AnyVal* is
+  // owned by this expr. This should only be called after Open() has been called on this
+  // expr.
+  // TODO: ExprContext argument
+  // TODO: Use this value directly in the codegen path
+  virtual impala_udf::AnyVal* GetConstVal();
+
   virtual std::string DebugString() const;
   static std::string DebugString(const std::vector<Expr*>& exprs);
+
+  // The builtin functions are not called from anywhere in the code and the
+  // symbols are therefore not included in the binary. We call these functions
+  // by using dlsym. The compiler must think this function is callable to
+  // not strip these symbols.
+  static void InitBuiltinsDummy();
 
   static const char* LLVM_CLASS_NAME;
 
  protected:
+  friend class AggFnEvaluator;
   friend class ComputeFunctions;
   friend class MathFunctions;
   friend class StringFunctions;
@@ -424,11 +449,15 @@ class Expr {
   // Return OK if successful, otherwise return error status.
   Status PrepareChildren(RuntimeState* state, const RowDescriptor& row_desc);
 
+  // Cache entry for the library implementing this function.
+  LibCache::LibCacheEntry* cache_entry_;
+
+  // Function description.
+  TFunction fn_;
+  bool is_udf_call_;
+
   // function to evaluate expr; typically set in Prepare()
   ComputeFn compute_fn_;
-
-  // function opcode
-  TExprOpcode::type opcode_;
 
   // recognize if this node is a slotref in order to speed up GetValue()
   const bool is_slotref_;
@@ -450,6 +479,13 @@ class Expr {
   // Size of scratch buffer necessary to call codegen'd compute function.
   // TODO: not implemented, always 0
   int scratch_buffer_size_;
+
+  // If this expr is constant, this will store and cache the value generated by
+  // GetConstVal().
+  boost::scoped_ptr<impala_udf::AnyVal> constant_val_;
+
+  // Set to true after Open() has been called.
+  bool opened_;
 
   // Returns an llvm::Function* with signature:
   // <subclass of AnyVal> ComputeFn(int8_t* context, TupleRow* row)
@@ -554,7 +590,7 @@ class SlotRef : public Expr {
   SlotRef(const SlotDescriptor* desc);
 
   // Used for testing.  GetValue will return tuple + offset interpreted as 'type'
-  SlotRef(PrimitiveType type, int offset);
+  SlotRef(const ColumnType& type, int offset);
 
   virtual Status Prepare(RuntimeState* state, const RowDescriptor& row_desc);
   static void* ComputeFn(Expr* expr, TupleRow* row);
@@ -575,6 +611,7 @@ class SlotRef : public Expr {
 inline void* SlotRef::ComputeFn(Expr* expr, TupleRow* row) {
   SlotRef* ref = static_cast<SlotRef*>(expr);
   Tuple* t = row->GetTuple(ref->tuple_idx_);
+  if (!ref->tuple_is_nullable_) DCHECK(t != NULL);
   if (t == NULL || t->IsNull(ref->null_indicator_offset_)) return NULL;
   return t->GetSlot(ref->slot_offset_);
 }
@@ -584,7 +621,7 @@ inline void* Expr::GetValue(TupleRow* row) {
   if (is_slotref_) {
     return SlotRef::ComputeFn(this, row);
   } else {
-    DCHECK(compute_fn_ != NULL);
+    DCHECK(compute_fn_ != NULL) << DebugString();
     return compute_fn_(this, row);
   }
 }

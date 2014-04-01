@@ -46,10 +46,12 @@ Status BaseSequenceScanner::IssueInitialRanges(HdfsScanNode* scan_node,
   for (int i = 0; i < files.size(); ++i) {
     ScanRangeMetadata* metadata =
         reinterpret_cast<ScanRangeMetadata*>(files[i]->splits[0]->meta_data());
+    // The header is almost always a remote read. Set the disk id to -1 and indicate
+    // it is not cached.
     // TODO: add remote disk id and plumb that through to the io mgr.  It should have
     // 1 queue for each NIC as well?
     DiskIoMgr::ScanRange* header_range = scan_node->AllocateScanRange(
-        files[i]->filename.c_str(), HEADER_SIZE, 0, metadata->partition_id, -1);
+        files[i]->filename.c_str(), HEADER_SIZE, 0, metadata->partition_id, -1, false);
     header_ranges.push_back(header_range);
   }
   RETURN_IF_ERROR(scan_node->AddDiskIoRanges(header_ranges));
@@ -82,7 +84,7 @@ void BaseSequenceScanner::Close() {
   VLOG_FILE << "Average block size: "
             << (num_syncs_ > 1 ? total_block_size_ / (num_syncs_ - 1) : 0);
   if (decompressor_.get() != NULL) decompressor_->Close();
-  AttachPool(data_buffer_pool_.get());
+  AttachPool(data_buffer_pool_.get(), false);
   AddFinalRowBatch();
   if (!only_parsing_header_) {
     scan_node_->RangeComplete(file_format(), header_->compression_type);
@@ -108,6 +110,7 @@ Status BaseSequenceScanner::ProcessSplit() {
     Status status = ReadFileHeader();
     if (!status.ok()) {
       if (state_->abort_on_error()) return status;
+      state_->LogError(status);
       // We need to complete the ranges for this file.
       CloseFileRanges(stream_->filename());
       return Status::OK;
@@ -122,7 +125,8 @@ Status BaseSequenceScanner::ProcessSplit() {
 
   // Initialize state for new scan range
   finished_ = false;
-  if (header_->is_compressed) stream_->set_compact_data(true);
+  // If the file is compressed, the buffers in the stream_ are not used directly.
+  if (header_->is_compressed) stream_->set_contains_tuple_data(false);
   RETURN_IF_ERROR(InitNewRange());
 
   Status status = Status::OK;

@@ -29,6 +29,7 @@ import com.cloudera.impala.thrift.TExplainLevel;
 import com.cloudera.impala.thrift.TPartitionType;
 import com.cloudera.impala.thrift.TPlanFragment;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
 
 /**
@@ -69,7 +70,7 @@ public class PlanFragment {
   // specification of the partition of the input of this fragment;
   // an UNPARTITIONED fragment is executed on only a single node
   // TODO: improve this comment, "input" is a bit misleading
-  private final DataPartition dataPartition_;
+  private DataPartition dataPartition_;
 
   // specification of how the output of this fragment is partitioned (i.e., how
   // it's sent to its destination);
@@ -122,7 +123,7 @@ public class PlanFragment {
     if (planRoot_ != null && validateFileFormats) {
       // verify that after partition pruning hdfs partitions only use supported formats
       ArrayList<HdfsScanNode> hdfsScans = Lists.newArrayList();
-      planRoot_.collectSubclasses(HdfsScanNode.class, hdfsScans);
+      planRoot_.collect(Predicates.instanceOf(HdfsScanNode.class), hdfsScans);
       for (HdfsScanNode hdfsScanNode: hdfsScans) {
         hdfsScanNode.validateFileFormat();
       }
@@ -252,6 +253,9 @@ public class PlanFragment {
   public PlanFragment getDestFragment() { return destNode_.getFragment(); }
   public ExchangeNode getDestNode() { return destNode_; }
   public DataPartition getDataPartition() { return dataPartition_; }
+  public void setDataPartition(DataPartition dataPartition) {
+    this.dataPartition_ = dataPartition;
+  }
   public DataPartition getOutputPartition() { return outputPartition_; }
   public void setOutputPartition(DataPartition outputPartition) {
     this.outputPartition_ = outputPartition;

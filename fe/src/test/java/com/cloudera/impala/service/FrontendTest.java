@@ -7,6 +7,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.util.List;
+import java.util.Set;
 
 import org.apache.hive.service.cli.thrift.TGetCatalogsReq;
 import org.apache.hive.service.cli.thrift.TGetColumnsReq;
@@ -14,14 +15,13 @@ import org.apache.hive.service.cli.thrift.TGetFunctionsReq;
 import org.apache.hive.service.cli.thrift.TGetInfoReq;
 import org.apache.hive.service.cli.thrift.TGetSchemasReq;
 import org.apache.hive.service.cli.thrift.TGetTablesReq;
-import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.cloudera.impala.authorization.AuthorizationConfig;
-import com.cloudera.impala.catalog.Catalog;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.ImpalaException;
+import com.cloudera.impala.testutil.ImpaladTestCatalog;
 import com.cloudera.impala.testutil.TestUtils;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
 import com.cloudera.impala.thrift.TMetadataOpcode;
@@ -29,6 +29,7 @@ import com.cloudera.impala.thrift.TQueryContext;
 import com.cloudera.impala.thrift.TResultRow;
 import com.cloudera.impala.thrift.TResultSet;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 /**
  * Unit test for Frontend.execHiveServer2MetadataOp, which executes a HiveServer2
@@ -39,14 +40,9 @@ import com.google.common.collect.Lists;
  *
  */
 public class FrontendTest {
-  private static Frontend fe_ = new Frontend(Catalog.CatalogInitStrategy.LAZY,
-      AuthorizationConfig.createAuthDisabledConfig());
-
-  @BeforeClass
-  public static void setUp() throws Exception {
-    fe_ = new Frontend(Catalog.CatalogInitStrategy.LAZY,
-        AuthorizationConfig.createAuthDisabledConfig());
-  }
+  private static Frontend fe_ = new Frontend(
+      AuthorizationConfig.createAuthDisabledConfig(),
+      new ImpaladTestCatalog(AuthorizationConfig.createAuthDisabledConfig()));
 
   @Test
   public void TestCatalogNotReady() throws ImpalaException {
@@ -78,9 +74,10 @@ public class FrontendTest {
     // DatabaseMetaData.getTypeInfo has 18 columns.
     assertEquals(18, resp.schema.columns.size());
     assertEquals(18, resp.rows.get(0).colVals.size());
-    // All primitives types, except INVALID_TYPE, DATE, DATETIME and CHAR, should be
-    // returned. Therefore #supported types =  PrimitiveType.values().length - 4.
-    assertEquals(PrimitiveType.values().length - 4, resp.rows.size());
+    // All primitives types, except INVALID_TYPE, DATE, DATETIME DECIMAL and CHAR,
+    // should be returned.
+    // Therefore #supported types =  PrimitiveType.values().length - 5.
+    assertEquals(PrimitiveType.values().length - 5, resp.rows.size());
   }
 
   @Test
@@ -176,14 +173,18 @@ public class FrontendTest {
     assertEquals(6, resp.schema.columns.size());
     assertEquals(6, resp.rows.get(0).colVals.size());
 
-    assertEquals(3, resp.rows.size());
+    Set<String> fns = Sets.newHashSet();
+    for (TResultRow row: resp.rows) {
+      String fn = row.colVals.get(2).stringVal.toLowerCase();
+      fns.add(fn);
+    }
+    assertEquals(3, fns.size());
 
     List<String> expectedResult = Lists.newArrayList();
     expectedResult.add("subdate");
     expectedResult.add("substr");
     expectedResult.add("substring");
-    for (TResultRow row: resp.rows) {
-      String fn = row.colVals.get(2).stringVal.toLowerCase();
+    for (String fn: fns) {
       assertTrue(fn + " not found", expectedResult.remove(fn));
     }
   }

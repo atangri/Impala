@@ -29,6 +29,8 @@ using namespace impala;
 using namespace llvm;
 using namespace std;
 
+const char* BlockingJoinNode::LLVM_CLASS_NAME = "class.impala::BlockingJoinNode";
+
 BlockingJoinNode::BlockingJoinNode(const string& node_name, const TJoinOp::type join_op,
     ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs)
   : ExecNode(pool, tnode, descs),
@@ -91,7 +93,7 @@ void BlockingJoinNode::BuildSideThread(RuntimeState* state, Promise<Status>* sta
 }
 
 Status BlockingJoinNode::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
+  RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(state->CheckQueryState());
   SCOPED_TIMER(runtime_profile_->total_time_counter());
@@ -107,6 +109,11 @@ Status BlockingJoinNode::Open(RuntimeState* state) {
     AddRuntimeExecOption("Join Build-Side Prepared Asynchronously");
     Thread build_thread(node_name_, "build thread",
         bind(&BlockingJoinNode::BuildSideThread, this, state, &build_side_status));
+    if (!state->cgroup().empty()) {
+      RETURN_IF_ERROR(
+          state->exec_env()->cgroups_mgr()->AssignThreadToCgroup(
+              build_thread, state->cgroup()));
+    }
   } else {
     build_side_status.Set(ConstructBuildSide(state));
   }
@@ -139,7 +146,6 @@ Status BlockingJoinNode::Open(RuntimeState* state) {
       continue;
     } else {
       current_left_child_row_ = left_batch_->GetRow(left_batch_pos_++);
-      VLOG_ROW << "left child row: " << GetLeftChildRowString(current_left_child_row_);
       InitGetNext(current_left_child_row_);
       break;
     }

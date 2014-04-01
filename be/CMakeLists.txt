@@ -97,8 +97,8 @@ SET(CMAKE_CXX_FLAGS "${CXX_COMMON_FLAGS} ${CMAKE_CXX_FLAGS}")
 SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fverbose-asm")
 SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${LLVM_CFLAGS}")
 
-# Thrift requires these two definitions for some types that we use
-add_definitions(-DHAVE_INTTYPES_H -DHAVE_NETINET_IN_H)
+# Thrift requires these definitions for some types that we use
+add_definitions(-DHAVE_INTTYPES_H -DHAVE_NETINET_IN_H -DHAVE_NETDB_H)
 
 # Set clang to IR cross compile flags
 # IR_COMPILE is #defined for the cross compile to remove code that bloats the IR
@@ -116,7 +116,9 @@ if (DOXYGEN_FOUND)
     ${CMAKE_SOURCE_DIR}/be/src/common/
     ${CMAKE_SOURCE_DIR}/be/src/exec/
     ${CMAKE_SOURCE_DIR}/be/src/exprs/
+    ${CMAKE_SOURCE_DIR}/be/src/resourcebroker/
     ${CMAKE_SOURCE_DIR}/be/src/runtime/
+    ${CMAKE_SOURCE_DIR}/be/src/scheduling/
     ${CMAKE_SOURCE_DIR}/be/src/service/
     ${CMAKE_SOURCE_DIR}/be/src/statestore/
     ${CMAKE_SOURCE_DIR}/be/src/testutil/
@@ -183,8 +185,10 @@ set (IMPALA_LINK_LIBS
   GlobalFlags
   ImpalaThrift
   Opcode
+  ResourceBroker
   Rpc
   Runtime
+  Scheduling
   Service
   Statestore
   TestUtil
@@ -277,8 +281,10 @@ add_subdirectory(src/catalog)
 add_subdirectory(src/codegen)
 add_subdirectory(src/common)
 add_subdirectory(src/exec)
+add_subdirectory(src/resourcebroker)
 add_subdirectory(src/exprs)
 add_subdirectory(src/runtime)
+add_subdirectory(src/scheduling)
 add_subdirectory(src/statestore)
 add_subdirectory(src/service)
 add_subdirectory(src/testutil)

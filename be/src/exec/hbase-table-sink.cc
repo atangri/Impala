@@ -42,7 +42,7 @@ Status HBaseTableSink::PrepareExprs(RuntimeState* state) {
   return Status::OK;
 }
 
-Status HBaseTableSink::Init(RuntimeState* state) {
+Status HBaseTableSink::Prepare(RuntimeState* state) {
   runtime_profile_ = state->obj_pool()->Add(
       new RuntimeProfile(state->obj_pool(), "HbaseTableSink"));
   SCOPED_TIMER(runtime_profile_->total_time_counter());
@@ -65,6 +65,10 @@ Status HBaseTableSink::Init(RuntimeState* state) {
   return Status::OK;
 }
 
+Status HBaseTableSink::Open(RuntimeState* state) {
+  return Expr::Open(output_exprs_, state);
+}
+
 Status HBaseTableSink::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   // Since everything is set up just forward everything to the writer.
@@ -74,12 +78,15 @@ Status HBaseTableSink::Send(RuntimeState* state, RowBatch* batch, bool eos) {
 }
 
 void HBaseTableSink::Close(RuntimeState* state) {
+  if (closed_) return;
   SCOPED_TIMER(runtime_profile_->total_time_counter());
 
   if (hbase_table_writer_.get() != NULL) {
     hbase_table_writer_->Close(state);
     hbase_table_writer_.reset(NULL);
   }
+  Expr::Close(output_exprs_, state);
+  closed_ = true;
 }
 
 }  // namespace impala

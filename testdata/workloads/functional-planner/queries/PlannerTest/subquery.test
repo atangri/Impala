@@ -16,12 +16,12 @@ where month = 1
 |  hash predicates: t2.int_col = int_col
 |
 |--02:TOP-N [LIMIT=5]
-|  |  order by: COUNT(*) DESC
+|  |  order by: count(*) DESC
 |  |
 |  01:AGGREGATE [FINALIZE]
-|  |  output: COUNT(*)
+|  |  output: count(*)
 |  |  group by: int_col
-|  |  having: COUNT(*) > 1
+|  |  having: count(*) > 1
 |  |
 |  00:SCAN HDFS [functional.alltypessmall]
 |     partitions=1/4 size=1.57KB
@@ -38,22 +38,22 @@ where month = 1
 |  |  limit: 5
 |  |
 |  08:TOP-N [LIMIT=5]
-|  |  order by: COUNT(*) DESC
+|  |  order by: count(*) DESC
 |  |
 |  07:EXCHANGE [PARTITION=UNPARTITIONED]
 |  |
 |  02:TOP-N [LIMIT=5]
-|  |  order by: COUNT(*) DESC
+|  |  order by: count(*) DESC
 |  |
 |  06:AGGREGATE [MERGE FINALIZE]
-|  |  output: SUM(COUNT(*))
+|  |  output: sum(count(*))
 |  |  group by: int_col
-|  |  having: COUNT(*) > 1
+|  |  having: count(*) > 1
 |  |
 |  05:EXCHANGE [PARTITION=HASH(int_col)]
 |  |
 |  01:AGGREGATE
-|  |  output: COUNT(*)
+|  |  output: count(*)
 |  |  group by: int_col
 |  |
 |  00:SCAN HDFS [functional.alltypessmall]
@@ -193,12 +193,12 @@ and b.id + 15 = 27
 |  other predicates: day >= 6, tinyint_col = 15, tinyint_col + tinyint_col < 15
 |
 |--01:SCAN HDFS [functional.alltypessmall]
-|     partitions=2/4 size=6.33KB compact
-|     predicates: id + 15 = 27, string_col = '15'
+|     partitions=2/4 size=3.17KB compact
+|     predicates: functional.alltypessmall.string_col = '15', functional.alltypessmall.id + 15 = 27
 |
 00:SCAN HDFS [functional.alltypesagg]
-   partitions=5/10 size=744.76KB
-   predicates: functional.alltypesagg.id + 15 = 27, functional.alltypesagg.tinyint_col = 15
+   partitions=5/10 size=372.38KB
+   predicates: functional.alltypesagg.tinyint_col = 15, functional.alltypesagg.id + 15 = 27
 ---- DISTRIBUTEDPLAN
 05:EXCHANGE [PARTITION=UNPARTITIONED]
 |
@@ -209,14 +209,14 @@ and b.id + 15 = 27
 |--04:EXCHANGE [PARTITION=HASH(id,int_col)]
 |  |
 |  01:SCAN HDFS [functional.alltypessmall]
-|     partitions=2/4 size=6.33KB
-|     predicates: id + 15 = 27, string_col = '15'
+|     partitions=2/4 size=3.17KB
+|     predicates: functional.alltypessmall.string_col = '15', functional.alltypessmall.id + 15 = 27
 |
 03:EXCHANGE [PARTITION=HASH(id,int_col)]
 |
 00:SCAN HDFS [functional.alltypesagg]
-   partitions=5/10 size=744.76KB
-   predicates: functional.alltypesagg.id + 15 = 27, functional.alltypesagg.tinyint_col = 15
+   partitions=5/10 size=372.38KB
+   predicates: functional.alltypesagg.tinyint_col = 15, functional.alltypesagg.id + 15 = 27
 ====
 # subquery join
 # multiple join predicates;
@@ -241,11 +241,11 @@ and a.tinyint_col + b.tinyint_col < 15
 |  other predicates: tinyint_col = 15, tinyint_col + tinyint_col < 15
 |
 |--01:SCAN HDFS [functional.alltypessmall]
-|     partitions=2/4 size=6.33KB compact
-|     predicates: string_col = '15'
+|     partitions=2/4 size=3.17KB compact
+|     predicates: functional.alltypessmall.string_col = '15'
 |
 00:SCAN HDFS [functional.alltypesagg]
-   partitions=5/10 size=1.09MB
+   partitions=5/10 size=372.38KB
    predicates: functional.alltypesagg.tinyint_col = 15
 ---- SCANRANGELOCATIONS
 NODE 0:
@@ -267,13 +267,13 @@ NODE 1:
 |--04:EXCHANGE [PARTITION=HASH(id,int_col)]
 |  |
 |  01:SCAN HDFS [functional.alltypessmall]
-|     partitions=2/4 size=6.33KB
-|     predicates: string_col = '15'
+|     partitions=2/4 size=3.17KB
+|     predicates: functional.alltypessmall.string_col = '15'
 |
 03:EXCHANGE [PARTITION=HASH(id,int_col)]
 |
 00:SCAN HDFS [functional.alltypesagg]
-   partitions=5/10 size=1.09MB
+   partitions=5/10 size=372.38KB
    predicates: functional.alltypesagg.tinyint_col = 15
 ====
 # complex join, having joined subquery on the rhs, and predicate
@@ -309,7 +309,7 @@ and x.int_col + x.float_col + cast(c.string_col as float) < 1000
 |     predicates: b.float_col > 4.5
 |
 01:SCAN HDFS [functional.alltypesagg a]
-   partitions=1/10 size=146.78KB
+   partitions=1/10 size=73.39KB
    predicates: a.int_col > 899
 ---- SCANRANGELOCATIONS
 NODE 0:
@@ -347,7 +347,7 @@ NODE 2:
 |     predicates: b.float_col > 4.5
 |
 01:SCAN HDFS [functional.alltypesagg a]
-   partitions=1/10 size=146.78KB
+   partitions=1/10 size=73.39KB
    predicates: a.int_col > 899
 ====
 # with grouping
@@ -357,11 +357,11 @@ from (select * from functional.alltypesagg) a
 group by 1
 ---- PLAN
 01:AGGREGATE [FINALIZE]
-|  output: COUNT(*), MIN(functional.alltypesagg.tinyint_col), MAX(functional.alltypesagg.tinyint_col), SUM(functional.alltypesagg.tinyint_col), COUNT(functional.alltypesagg.tinyint_col)
+|  output: count(*), min(functional.alltypesagg.tinyint_col), max(functional.alltypesagg.tinyint_col), sum(functional.alltypesagg.tinyint_col), count(functional.alltypesagg.tinyint_col)
 |  group by: functional.alltypesagg.tinyint_col
 |
 00:SCAN HDFS [functional.alltypesagg]
-   partitions=10/10 size=1.45MB
+   partitions=10/10 size=743.67KB
 ---- SCANRANGELOCATIONS
 NODE 0:
   HDFS SPLIT hdfs://localhost:20500/test-warehouse/alltypesagg/year=2010/month=1/day=1/100101.txt 0:75153
@@ -378,17 +378,17 @@ NODE 0:
 04:EXCHANGE [PARTITION=UNPARTITIONED]
 |
 03:AGGREGATE [MERGE FINALIZE]
-|  output: SUM(COUNT(*)), MIN(MIN(tinyint_col)), MAX(MAX(tinyint_col)), SUM(SUM(tinyint_col)), SUM(COUNT(tinyint_col))
+|  output: sum(count(*)), min(min(tinyint_col)), max(max(tinyint_col)), sum(sum(tinyint_col)), sum(count(tinyint_col))
 |  group by: tinyint_col
 |
 02:EXCHANGE [PARTITION=HASH(tinyint_col)]
 |
 01:AGGREGATE
-|  output: COUNT(*), MIN(functional.alltypesagg.tinyint_col), MAX(functional.alltypesagg.tinyint_col), SUM(functional.alltypesagg.tinyint_col), COUNT(functional.alltypesagg.tinyint_col)
+|  output: count(*), min(functional.alltypesagg.tinyint_col), max(functional.alltypesagg.tinyint_col), sum(functional.alltypesagg.tinyint_col), count(functional.alltypesagg.tinyint_col)
 |  group by: functional.alltypesagg.tinyint_col
 |
 00:SCAN HDFS [functional.alltypesagg]
-   partitions=10/10 size=1.45MB
+   partitions=10/10 size=743.67KB
 ====
 # with grouping
 select * from (
@@ -399,7 +399,7 @@ group by 1
 ) a
 ---- PLAN
 01:AGGREGATE [FINALIZE]
-|  output: COUNT(*), MIN(tinyint_col), MAX(tinyint_col), SUM(tinyint_col), COUNT(tinyint_col)
+|  output: count(*), min(tinyint_col), max(tinyint_col), sum(tinyint_col), count(tinyint_col)
 |  group by: tinyint_col
 |
 00:SCAN HDFS [functional.alltypesagg]
@@ -408,13 +408,13 @@ group by 1
 04:EXCHANGE [PARTITION=UNPARTITIONED]
 |
 03:AGGREGATE [MERGE FINALIZE]
-|  output: SUM(COUNT(*)), MIN(MIN(tinyint_col)), MAX(MAX(tinyint_col)), SUM(SUM(tinyint_col)), SUM(COUNT(tinyint_col))
+|  output: sum(count(*)), min(min(tinyint_col)), max(max(tinyint_col)), sum(sum(tinyint_col)), sum(count(tinyint_col))
 |  group by: tinyint_col
 |
 02:EXCHANGE [PARTITION=HASH(tinyint_col)]
 |
 01:AGGREGATE
-|  output: COUNT(*), MIN(tinyint_col), MAX(tinyint_col), SUM(tinyint_col), COUNT(tinyint_col)
+|  output: count(*), min(tinyint_col), max(tinyint_col), sum(tinyint_col), count(tinyint_col)
 |  group by: tinyint_col
 |
 00:SCAN HDFS [functional.alltypesagg]
@@ -435,7 +435,7 @@ from
 |  order by: c2 ASC, c3 DESC
 |
 01:AGGREGATE [FINALIZE]
-|  output: SUM(float_col), MIN(float_col)
+|  output: sum(float_col), min(float_col)
 |  group by: int_col
 |
 00:SCAN HBASE [functional_hbase.alltypessmall]
@@ -449,13 +449,13 @@ from
 |  order by: c2 ASC, c3 DESC
 |
 04:AGGREGATE [MERGE FINALIZE]
-|  output: SUM(SUM(float_col)), MIN(MIN(float_col))
+|  output: sum(sum(float_col)), min(min(float_col))
 |  group by: int_col
 |
 03:EXCHANGE [PARTITION=HASH(int_col)]
 |
 01:AGGREGATE
-|  output: SUM(float_col), MIN(float_col)
+|  output: sum(float_col), min(float_col)
 |  group by: int_col
 |
 00:SCAN HBASE [functional_hbase.alltypessmall]
@@ -482,14 +482,14 @@ limit 0
 |  order by: x2 ASC, c1 DESC
 |
 03:AGGREGATE [FINALIZE]
-|  output: MIN(tinyint_col)
+|  output: min(tinyint_col)
 |  group by: int_col
 |
 02:TOP-N [LIMIT=1]
 |  order by: int_col ASC, tinyint_col ASC
 |
 01:AGGREGATE [FINALIZE]
-|  output: MIN(float_col)
+|  output: min(float_col)
 |  group by: int_col, tinyint_col
 |
 00:SCAN HBASE [functional_hbase.alltypessmall]
@@ -498,7 +498,7 @@ limit 0
 |  order by: x2 ASC, c1 DESC
 |
 03:AGGREGATE [FINALIZE]
-|  output: MIN(tinyint_col)
+|  output: min(tinyint_col)
 |  group by: int_col
 |
 08:TOP-N [LIMIT=1]
@@ -510,13 +510,13 @@ limit 0
 |  order by: int_col ASC, tinyint_col ASC
 |
 06:AGGREGATE [MERGE FINALIZE]
-|  output: MIN(MIN(float_col))
+|  output: min(min(float_col))
 |  group by: int_col, tinyint_col
 |
 05:EXCHANGE [PARTITION=HASH(int_col,tinyint_col)]
 |
 01:AGGREGATE
-|  output: MIN(float_col)
+|  output: min(float_col)
 |  group by: int_col, tinyint_col
 |
 00:SCAN HBASE [functional_hbase.alltypessmall]
@@ -603,28 +603,28 @@ where c1 is not null
 and   c2 > 10
 ---- PLAN
 01:AGGREGATE [FINALIZE]
-|  output: COUNT(*), SUM(functional.alltypesagg.int_col), COUNT(functional.alltypesagg.int_col)
+|  output: count(*), sum(functional.alltypesagg.int_col), count(functional.alltypesagg.int_col)
 |  group by: functional.alltypesagg.int_col % 7
-|  having: int_col % 7 IS NOT NULL, COUNT(*) > 10, SUM(int_col) / COUNT(int_col) > 500.0 OR COUNT(*) = 10
+|  having: sum(int_col) / count(int_col) > 500.0 OR count(*) = 10, count(*) > 10, int_col % 7 IS NOT NULL
 |
 00:SCAN HDFS [functional.alltypesagg]
-   partitions=10/10 size=1.45MB
+   partitions=10/10 size=743.67KB
 ---- DISTRIBUTEDPLAN
 04:EXCHANGE [PARTITION=UNPARTITIONED]
 |
 03:AGGREGATE [MERGE FINALIZE]
-|  output: SUM(COUNT(*)), SUM(SUM(int_col)), SUM(COUNT(int_col))
+|  output: sum(count(*)), sum(sum(int_col)), sum(count(int_col))
 |  group by: int_col % 7
-|  having: int_col % 7 IS NOT NULL, COUNT(*) > 10, SUM(int_col) / COUNT(int_col) > 500.0 OR COUNT(*) = 10
+|  having: sum(int_col) / count(int_col) > 500.0 OR count(*) = 10, count(*) > 10, int_col % 7 IS NOT NULL
 |
 02:EXCHANGE [PARTITION=HASH(int_col % 7)]
 |
 01:AGGREGATE
-|  output: COUNT(*), SUM(functional.alltypesagg.int_col), COUNT(functional.alltypesagg.int_col)
+|  output: count(*), sum(functional.alltypesagg.int_col), count(functional.alltypesagg.int_col)
 |  group by: functional.alltypesagg.int_col % 7
 |
 00:SCAN HDFS [functional.alltypesagg]
-   partitions=10/10 size=1.45MB
+   partitions=10/10 size=743.67KB
 ====
 # subquery with left outer join
 select j.*, d.*
@@ -644,10 +644,10 @@ where j.test_id <= 1006
 |  hash predicates: a.test_name = b.name
 |
 |--01:SCAN HDFS [functional.dimtbl b]
-|     partitions=1/1 size=342B compact
+|     partitions=1/1 size=171B compact
 |
 00:SCAN HDFS [functional.jointbl a]
-   partitions=1/1 size=866B
+   partitions=1/1 size=433B
    predicates: a.test_id <= 1006
 ---- DISTRIBUTEDPLAN
 05:EXCHANGE [PARTITION=UNPARTITIONED]
@@ -658,12 +658,12 @@ where j.test_id <= 1006
 |--04:EXCHANGE [PARTITION=HASH(b.name)]
 |  |
 |  01:SCAN HDFS [functional.dimtbl b]
-|     partitions=1/1 size=342B
+|     partitions=1/1 size=171B
 |
 03:EXCHANGE [PARTITION=HASH(a.test_name)]
 |
 00:SCAN HDFS [functional.jointbl a]
-   partitions=1/1 size=866B
+   partitions=1/1 size=433B
    predicates: a.test_id <= 1006
 ====
 # complex join, having joined subquery on the rhs, and predicate
@@ -686,7 +686,7 @@ from functional.alltypessmall c
 group by x.smallint_col
 ---- PLAN
 05:AGGREGATE [FINALIZE]
-|  output: COUNT(b.id)
+|  output: count(b.id)
 |  group by: a.smallint_col
 |
 04:HASH JOIN [LEFT OUTER JOIN]
@@ -699,7 +699,7 @@ group by x.smallint_col
 |  |     partitions=4/4 size=6.32KB compact
 |  |
 |  01:SCAN HDFS [functional.alltypesagg a]
-|     partitions=10/10 size=1.45MB compact
+|     partitions=10/10 size=743.67KB compact
 |
 00:SCAN HDFS [functional.alltypessmall c]
    partitions=4/4 size=6.32KB
@@ -707,13 +707,13 @@ group by x.smallint_col
 11:EXCHANGE [PARTITION=UNPARTITIONED]
 |
 10:AGGREGATE [MERGE FINALIZE]
-|  output: SUM(COUNT(x.id))
+|  output: sum(count(x.id))
 |  group by: x.smallint_col
 |
 09:EXCHANGE [PARTITION=HASH(x.smallint_col)]
 |
 05:AGGREGATE
-|  output: COUNT(b.id)
+|  output: count(b.id)
 |  group by: a.smallint_col
 |
 04:HASH JOIN [LEFT OUTER JOIN, PARTITIONED]
@@ -730,7 +730,7 @@ group by x.smallint_col
 |  |     partitions=4/4 size=6.32KB
 |  |
 |  01:SCAN HDFS [functional.alltypesagg a]
-|     partitions=10/10 size=1.45MB
+|     partitions=10/10 size=743.67KB
 |
 07:EXCHANGE [PARTITION=HASH(c.id)]
 |
@@ -778,7 +778,7 @@ and x.int_col + x.float_col + CAST(c.string_col AS FLOAT) < 1000
 |     predicates: b.float_col > 4.5
 |
 00:SCAN HDFS [functional.alltypesagg a]
-   partitions=1/10 size=146.78KB
+   partitions=1/10 size=73.39KB
    predicates: a.int_col > 899
 ---- DISTRIBUTEDPLAN
 07:EXCHANGE [PARTITION=UNPARTITIONED]
@@ -803,7 +803,7 @@ and x.int_col + x.float_col + CAST(c.string_col AS FLOAT) < 1000
 |     predicates: b.float_col > 4.5
 |
 00:SCAN HDFS [functional.alltypesagg a]
-   partitions=1/10 size=146.78KB
+   partitions=1/10 size=73.39KB
    predicates: a.int_col > 899
 ====
 # complex join, having joined aggregate subquery on the rhs, and predicate
@@ -819,14 +819,14 @@ from functional.alltypessmall c
 group by x.smallint_col
 ---- PLAN
 06:AGGREGATE [FINALIZE]
-|  output: SUM(COUNT(a.id))
+|  output: sum(count(a.id))
 |  group by: b.smallint_col
 |
 05:HASH JOIN [INNER JOIN]
 |  hash predicates: c.id = b.smallint_col
 |
 |--04:AGGREGATE [FINALIZE]
-|  |  output: COUNT(a.id)
+|  |  output: count(a.id)
 |  |  group by: b.smallint_col
 |  |
 |  03:HASH JOIN [INNER JOIN]
@@ -836,7 +836,7 @@ group by x.smallint_col
 |  |     partitions=4/4 size=6.32KB compact
 |  |
 |  01:SCAN HDFS [functional.alltypesagg a]
-|     partitions=10/10 size=1.45MB
+|     partitions=10/10 size=743.67KB
 |
 00:SCAN HDFS [functional.alltypessmall c]
    partitions=4/4 size=6.32KB
@@ -844,13 +844,13 @@ group by x.smallint_col
 13:EXCHANGE [PARTITION=UNPARTITIONED]
 |
 12:AGGREGATE [MERGE FINALIZE]
-|  output: SUM(SUM(x.cnt))
+|  output: sum(sum(x.cnt))
 |  group by: x.smallint_col
 |
 11:EXCHANGE [PARTITION=HASH(x.smallint_col)]
 |
 06:AGGREGATE
-|  output: SUM(COUNT(a.id))
+|  output: sum(count(a.id))
 |  group by: b.smallint_col
 |
 05:HASH JOIN [INNER JOIN, BROADCAST]
@@ -859,13 +859,13 @@ group by x.smallint_col
 |--10:EXCHANGE [BROADCAST]
 |  |
 |  09:AGGREGATE [MERGE FINALIZE]
-|  |  output: SUM(COUNT(a.id))
+|  |  output: sum(count(a.id))
 |  |  group by: b.smallint_col
 |  |
 |  08:EXCHANGE [PARTITION=HASH(b.smallint_col)]
 |  |
 |  04:AGGREGATE
-|  |  output: COUNT(a.id)
+|  |  output: count(a.id)
 |  |  group by: b.smallint_col
 |  |
 |  03:HASH JOIN [INNER JOIN, BROADCAST]
@@ -877,7 +877,7 @@ group by x.smallint_col
 |  |     partitions=4/4 size=6.32KB
 |  |
 |  01:SCAN HDFS [functional.alltypesagg a]
-|     partitions=10/10 size=1.45MB
+|     partitions=10/10 size=743.67KB
 |
 00:SCAN HDFS [functional.alltypessmall c]
    partitions=4/4 size=6.32KB
@@ -907,8 +907,8 @@ select * from
 |  constant-selects=1
 |
 01:SCAN HDFS [functional.alltypes]
-   partitions=24/24 size=956.90KB
-   predicates: tinyint_col < 10
+   partitions=24/24 size=478.45KB
+   predicates: functional.alltypes.tinyint_col < 10
 ---- DISTRIBUTEDPLAN
 02:EXCHANGE [PARTITION=UNPARTITIONED]
 |
@@ -920,8 +920,8 @@ select * from
 |  predicates: y < 10
 |
 01:SCAN HDFS [functional.alltypes]
-   partitions=24/24 size=956.90KB
-   predicates: tinyint_col < 10
+   partitions=24/24 size=478.45KB
+   predicates: functional.alltypes.tinyint_col < 10
 ====
 # Union of constant selects in subquery
 # TODO: We could combine the merge nodes below.

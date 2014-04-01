@@ -26,7 +26,7 @@
 
 using namespace std;
 
-namespace impala { 
+namespace impala {
 
 const char* MathFunctions::ALPHANUMERIC_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -270,9 +270,11 @@ void* MathFunctions::HexString(Expr* e, TupleRow* row) {
   StringValue* s = reinterpret_cast<StringValue*>(e->children()[0]->GetValue(row));
   if (s == NULL) return NULL;
   stringstream ss;
-  ss << hex << uppercase << setw(2) << setfill('0');
+  ss << hex << uppercase << setfill('0');
   for (int i = 0; i < s->len; ++i) {
-    ss << static_cast<int32_t>(s->ptr[i]);
+    // setw is not sticky. stringstream only converts integral values,
+    // so a cast to int is required, but only convert the least significant byte to hex.
+    ss << setw(2) << (static_cast<int32_t>(s->ptr[i]) & 0xFF);
   }
   e->result_.SetStringVal(ss.str());
   return &e->result_.string_val;
@@ -544,7 +546,7 @@ void* MathFunctions::QuotientDouble(Expr* e, TupleRow* row) {
 }
 
 void* MathFunctions::QuotientBigInt(Expr* e, TupleRow* row) {
-  return ComputeFunctions::Int_Divide_long_long(e, row);
+  return ComputeFunctions::Int_divide_long_long(e, row);
 }
 
 template <typename T, bool ISLEAST>

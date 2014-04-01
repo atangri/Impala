@@ -119,7 +119,7 @@ Status HBaseScanNode::Prepare(RuntimeState* state) {
 }
 
 Status HBaseScanNode::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
+  RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(state->CheckQueryState());
   SCOPED_TIMER(runtime_profile_->total_time_counter());
@@ -142,7 +142,7 @@ void HBaseScanNode::WriteTextSlot(
       ss << "Error converting column " << family
           << ":" << qualifier << ": "
           << "'" << string(reinterpret_cast<char*>(value), value_length) << "' TO "
-          << TypeToString(slot->type());
+          << slot->type();
       state->LogError(ss.str());
     }
   }
@@ -165,9 +165,7 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
 
   // create new tuple buffer for row_batch
   tuple_buffer_size_ = row_batch->capacity() * tuple_desc_->byte_size();
-  tuple_buffer_ = tuple_pool_->Allocate(tuple_buffer_size_);
-  bzero(tuple_buffer_, tuple_buffer_size_);
-  tuple_ = reinterpret_cast<Tuple*>(tuple_buffer_);
+  tuple_ = Tuple::Create(tuple_buffer_size_, tuple_pool_.get());
 
   // Indicates whether the current row has conversion errors. Used for error reporting.
   bool error_in_row = false;
@@ -178,8 +176,8 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
   while (true) {
     RETURN_IF_CANCELLED(state);
     RETURN_IF_ERROR(state->CheckQueryState());
-    if (ReachedLimit() || row_batch->IsFull() ||
-        tuple_pool_->total_allocated_bytes() > RowBatch::MAX_MEM_POOL_SIZE) {
+    if (ReachedLimit() || row_batch->AtCapacity() ||
+        tuple_pool_->total_allocated_bytes() > RowBatch::AT_CAPACITY_MEM_USAGE) {
       // hang on to last allocated chunk in pool, we'll keep writing into it in the
       // next GetNext() call
       row_batch->tuple_data_pool()->AcquireData(tuple_pool_.get(), !ReachedLimit());

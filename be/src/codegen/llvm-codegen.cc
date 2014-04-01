@@ -51,7 +51,10 @@ using namespace llvm;
 using namespace std;
 
 DEFINE_bool(dump_ir, false, "if true, output IR after optimization passes");
-DEFINE_string(module_output, "", "if set, saves the generated IR to the output file.");
+DEFINE_string(unopt_module_output, "",
+              "if set, saves the unoptimized generated IR to the output file.");
+DEFINE_string(opt_module_output, "",
+              "if set, saves the optimized generated IR to the output file.");
 DECLARE_string(local_library_dir);
 
 namespace impala {
@@ -258,15 +261,6 @@ Status LlvmCodeGen::Init() {
 }
 
 LlvmCodeGen::~LlvmCodeGen() {
-  if (FLAGS_module_output.size() != 0) {
-    fstream f(FLAGS_module_output.c_str(), fstream::out | fstream::trunc);
-    if (f.fail()) {
-      LOG(ERROR) << "Could not save IR to: " << FLAGS_module_output;
-    } else {
-      f << GetIR(true);
-      f.close();
-    }
-  }
   for (map<Function*, bool>::iterator iter = jitted_functions_.begin();
       iter != jitted_functions_.end(); ++iter) {
     execution_engine_->freeMachineCodeForFunction(iter->first);
@@ -290,8 +284,8 @@ string LlvmCodeGen::GetIR(bool full_module) const {
   return str;
 }
 
-Type* LlvmCodeGen::GetType(PrimitiveType type) {
-  switch (type) {
+Type* LlvmCodeGen::GetType(const ColumnType& type) {
+  switch (type.type) {
     case TYPE_NULL:
       return Type::getInt1Ty(context());
     case TYPE_BOOLEAN:
@@ -318,7 +312,7 @@ Type* LlvmCodeGen::GetType(PrimitiveType type) {
   }
 }
 
-PointerType* LlvmCodeGen::GetPtrType(PrimitiveType type) {
+PointerType* LlvmCodeGen::GetPtrType(const ColumnType& type) {
   return PointerType::get(GetType(type), 0);
 }
 
@@ -339,8 +333,8 @@ Value* LlvmCodeGen::CastPtrToLlvmPtr(Type* type, void* ptr) {
   return ConstantExpr::getIntToPtr(const_int, type);
 }
 
-Value* LlvmCodeGen::GetIntConstant(PrimitiveType type, int64_t val) {
-  switch (type) {
+Value* LlvmCodeGen::GetIntConstant(const ColumnType& type, int64_t val) {
+  switch (type.type) {
     case TYPE_NULL:
       return ConstantInt::get(context(), APInt(8, val));
     case TYPE_TINYINT:
@@ -448,6 +442,8 @@ Function* LlvmCodeGen::FnPrototype::GeneratePrototype(
 Function* LlvmCodeGen::ReplaceCallSites(Function* caller, bool update_in_place,
     Function* new_fn, const string& replacee_name, int* replaced) {
   DCHECK(caller->getParent() == module_);
+  DCHECK(caller != NULL);
+  DCHECK(new_fn != NULL);
 
   if (!update_in_place) {
     // Clone the function and add it to the module
@@ -548,6 +544,16 @@ Status LlvmCodeGen::OptimizeModule() {
   DCHECK(!is_compiled_);
   is_compiled_ = true;
 
+  if (FLAGS_unopt_module_output.size() != 0) {
+    fstream f(FLAGS_unopt_module_output.c_str(), fstream::out | fstream::trunc);
+    if (f.fail()) {
+      LOG(ERROR) << "Could not save IR to: " << FLAGS_unopt_module_output;
+    } else {
+      f << GetIR(true);
+      f.close();
+    }
+  }
+
   if (is_corrupt_) return Status("Module is corrupt.");
   SCOPED_TIMER(profile_.total_time_counter());
   SCOPED_TIMER(compile_timer_);
@@ -590,6 +596,16 @@ Status LlvmCodeGen::OptimizeModule() {
   // Now that the module is optimized, it is safe to call jit fn.
   for (int i = 0; i < fns_to_jit_compile_.size(); ++i) {
     *fns_to_jit_compile_[i].second = JitFunction(fns_to_jit_compile_[i].first);
+  }
+
+  if (FLAGS_opt_module_output.size() != 0) {
+    fstream f(FLAGS_opt_module_output.c_str(), fstream::out | fstream::trunc);
+    if (f.fail()) {
+      LOG(ERROR) << "Could not save IR to: " << FLAGS_opt_module_output;
+    } else {
+      f << GetIR(true);
+      f.close();
+    }
   }
 
   return Status::OK;
@@ -695,7 +711,7 @@ void LlvmCodeGen::GetSymbols(unordered_set<string>* symbols) {
 // ret_v2:                                           ; preds = %entry
 //   ret i32 %v2
 // }
-Function* LlvmCodeGen::CodegenMinMax(PrimitiveType type, bool min) {
+Function* LlvmCodeGen::CodegenMinMax(const ColumnType& type, bool min) {
   LlvmCodeGen::FnPrototype prototype(this, min ? "Min" : "Max", GetType(type));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("v1", GetType(type)));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("v2", GetType(type)));
@@ -705,7 +721,7 @@ Function* LlvmCodeGen::CodegenMinMax(PrimitiveType type, bool min) {
   Function* fn = prototype.GeneratePrototype(&builder, &params[0]);
 
   Value* compare = NULL;
-  switch (type) {
+  switch (type.type) {
     case TYPE_NULL:
       compare = false_value();
       break;
@@ -740,7 +756,7 @@ Function* LlvmCodeGen::CodegenMinMax(PrimitiveType type, bool min) {
       DCHECK(false);
   }
 
-  if (type == TYPE_BOOLEAN) {
+  if (type.type == TYPE_BOOLEAN) {
     builder.CreateRet(compare);
   } else {
     BasicBlock* ret_v1, *ret_v2;
@@ -758,8 +774,8 @@ Function* LlvmCodeGen::CodegenMinMax(PrimitiveType type, bool min) {
 }
 
 Value* LlvmCodeGen::CodegenEquals(LlvmBuilder* builder, Value* v1, Value* v2,
-    PrimitiveType type) {
-  switch (type) {
+    const ColumnType& type) {
+  switch (type.type) {
     case TYPE_NULL: return false_value();
     case TYPE_BOOLEAN:
     case TYPE_TINYINT:
@@ -844,8 +860,8 @@ void LlvmCodeGen::CodegenMemcpy(LlvmBuilder* builder, Value* dst, Value* src, in
 }
 
 void LlvmCodeGen::CodegenAssign(LlvmBuilder* builder,
-    Value* dst, Value* src, PrimitiveType type) {
-  switch (type) {
+    Value* dst, Value* src, const ColumnType& type) {
+  switch (type.type) {
     case TYPE_STRING:  {
       CodegenMemcpy(builder, dst, src, sizeof(StringValue));
       break;

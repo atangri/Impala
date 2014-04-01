@@ -22,6 +22,7 @@
 #include "common/init.h"
 #include "common/logging.h"
 #include "common/status.h"
+#include "exec/catalog-op-executor.h"
 #include "exprs/expr.h"
 #include "runtime/exec-env.h"
 #include "runtime/runtime-state.h"
@@ -54,10 +55,10 @@ Java_com_cloudera_impala_service_FeSupport_NativeFeTestInit(
     JNIEnv* env, jclass caller_class) {
   DCHECK(ExecEnv::GetInstance() == NULL) << "This should only be called once from the FE";
   char* name = const_cast<char*>("FeSupport");
-  InitCommonRuntime(1, &name, false);
+  InitCommonRuntime(1, &name, false, true);
   LlvmCodeGen::InitializeLlvm();
   ExecEnv* exec_env = new ExecEnv(); // This also caches it from the process.
-  exec_env->set_is_fe_tests(true);
+  exec_env->InitForFeTests();
 }
 
 // Requires JniUtil::Init() to have been called.
@@ -75,8 +76,13 @@ Java_com_cloudera_impala_service_FeSupport_NativeEvalConstExpr(
   jbyteArray result_bytes = NULL;
   JniLocalFrame jni_frame;
   Expr* e;
+
   THROW_IF_ERROR_RET(jni_frame.push(env), env, JniUtil::internal_exc_class(),
                      result_bytes);
+  // Exprs can allocate memory so we need to set up the mem trackers before
+  // preparing/running the exprs.
+  THROW_IF_ERROR_RET(state.InitMemTrackers(TUniqueId(), NULL, -1), env,
+      JniUtil::internal_exc_class(), result_bytes);
   THROW_IF_ERROR_RET(Expr::CreateExprTree(&obj_pool, thrift_predicate, &e), env,
                      JniUtil::internal_exc_class(), result_bytes);
   THROW_IF_ERROR_RET(Expr::Prepare(e, &state, RowDescriptor()), env,
@@ -85,8 +91,10 @@ Java_com_cloudera_impala_service_FeSupport_NativeEvalConstExpr(
   // Optimize the module so any UDF functions are jit'd
   if (state.codegen() != NULL) state.codegen()->OptimizeModule();
 
+  THROW_IF_ERROR_RET(e->Open(&state), env, JniUtil::internal_exc_class(), result_bytes);
   TColumnValue val;
   e->GetValue(NULL, false, &val);
+  e->Close(&state);
   THROW_IF_ERROR_RET(SerializeThriftMsg(env, &val, &result_bytes), env,
                      JniUtil::internal_exc_class(), result_bytes);
   return result_bytes;
@@ -95,25 +103,29 @@ Java_com_cloudera_impala_service_FeSupport_NativeEvalConstExpr(
 // Does the symbol resolution, filling in the result in *result.
 static void ResolveSymbolLookup(const TSymbolLookupParams params,
     const vector<ColumnType>& arg_types, TSymbolLookupResult* result) {
-  ExecEnv* env = ExecEnv::GetInstance();
-  DCHECK(env != NULL);
   DCHECK(params.fn_binary_type == TFunctionBinaryType::NATIVE ||
-         params.fn_binary_type == TFunctionBinaryType::IR);
-  LibCache::LibType type = params.fn_binary_type == TFunctionBinaryType::NATIVE ?
-      LibCache::TYPE_SO : LibCache::TYPE_IR;
+         params.fn_binary_type == TFunctionBinaryType::IR ||
+         params.fn_binary_type == TFunctionBinaryType::BUILTIN);
+  // We use TYPE_SO for builtins, since LibCache does not resolve symbols for IR
+  // builtins. This is ok since builtins have the same symbol whether we run the IR or
+  // native versions.
+  LibCache::LibType type = params.fn_binary_type == TFunctionBinaryType::IR ?
+      LibCache::TYPE_IR : LibCache::TYPE_SO;
 
-  string dummy_local_path;
-  Status status =
-      env->lib_cache()->GetLocalLibPath(env->fs_cache(), params.location,
-          type, &dummy_local_path);
-  if (!status.ok()) {
-    result->__set_result_code(TSymbolLookupResultCode::BINARY_NOT_FOUND);
-    result->__set_error_msg(status.GetErrorMsg());
-    return;
+  if (params.fn_binary_type != TFunctionBinaryType::BUILTIN) {
+    // Builtin functions are loaded directly from the running process
+    string dummy_local_path;
+    Status status =
+        LibCache::instance()->GetLocalLibPath(params.location, type, &dummy_local_path);
+    if (!status.ok()) {
+      result->__set_result_code(TSymbolLookupResultCode::BINARY_NOT_FOUND);
+      result->__set_error_msg(status.GetErrorMsg());
+      return;
+    }
   }
 
-  status = env->lib_cache()->CheckSymbolExists(
-      env->fs_cache(), params.location, type, params.symbol);
+  Status status =
+      LibCache::instance()->CheckSymbolExists(params.location, type, params.symbol);
   if (status.ok()) {
     // The FE specified symbol exists, just use that.
     result->__set_result_code(TSymbolLookupResultCode::SYMBOL_FOUND);
@@ -134,21 +146,35 @@ static void ResolveSymbolLookup(const TSymbolLookupParams params,
   }
 
   // Mangle the user input and do another lookup.
+  string symbol;
   ColumnType ret_type(INVALID_TYPE);
   if (params.__isset.ret_arg_type) ret_type = ColumnType(params.ret_arg_type);
-  string symbol = SymbolsUtil::MangleUserFunction(params.symbol,
-      arg_types, params.has_var_args, params.__isset.ret_arg_type ? &ret_type : NULL);
 
-  status = env->lib_cache()->CheckSymbolExists(
-      env->fs_cache(), params.location, type, symbol);
+  if (params.symbol_type == TSymbolType::UDF_EVALUATE) {
+    symbol = SymbolsUtil::MangleUserFunction(params.symbol,
+        arg_types, params.has_var_args, params.__isset.ret_arg_type ? &ret_type : NULL);
+  } else {
+    DCHECK(params.symbol_type == TSymbolType::UDF_PREPARE ||
+           params.symbol_type == TSymbolType::UDF_CLOSE);
+    symbol = SymbolsUtil::ManglePrepareOrCloseFunction(params.symbol);
+  }
+
+  status = LibCache::instance()->CheckSymbolExists(params.location, type, symbol);
   if (!status.ok()) {
     result->__set_result_code(TSymbolLookupResultCode::SYMBOL_NOT_FOUND);
     stringstream ss;
     ss << "Could not find function " << params.symbol << "(";
-    for (int i = 0; i < arg_types.size(); ++i) {
-      ss << arg_types[i].DebugString();
-      if (i != arg_types.size() - 1) ss << ", ";
+
+    if (params.symbol_type == TSymbolType::UDF_EVALUATE) {
+      for (int i = 0; i < arg_types.size(); ++i) {
+        ss << arg_types[i].DebugString();
+        if (i != arg_types.size() - 1) ss << ", ";
+      }
+    } else {
+      ss << "impala_udf::FunctionContext*, "
+         << "impala_udf::FunctionContext::FunctionStateScope";
     }
+
     ss << ")";
     if (params.__isset.ret_arg_type) ss << " returns " << ret_type.DebugString();
     ss << " in: " << params.location;
@@ -187,6 +213,33 @@ Java_com_cloudera_impala_service_FeSupport_NativeLookupSymbol(
   return result_bytes;
 }
 
+// Calls in to the catalog server to request prioritizing the loading of metadata for
+// specific catalog objects.
+extern "C"
+JNIEXPORT jbyteArray JNICALL
+Java_com_cloudera_impala_service_FeSupport_NativePrioritizeLoad(
+    JNIEnv* env, jclass caller_class, jbyteArray thrift_struct) {
+  TPrioritizeLoadRequest request;
+  DeserializeThriftMsg(env, thrift_struct, &request);
+
+  CatalogOpExecutor catalog_op_executor(ExecEnv::GetInstance(), NULL);
+  TPrioritizeLoadResponse result;
+  Status status = catalog_op_executor.PrioritizeLoad(request, &result);
+  if (!status.ok()) {
+    LOG(ERROR) << status.GetErrorMsg();
+    // Create a new Status, copy in this error, then update the result.
+    Status catalog_service_status(result.status);
+    catalog_service_status.AddError(status);
+    status.ToThrift(&result.status);
+  }
+
+  jbyteArray result_bytes = NULL;
+  THROW_IF_ERROR_RET(SerializeThriftMsg(env, &result, &result_bytes), env,
+                     JniUtil::internal_exc_class(), result_bytes);
+  return result_bytes;
+}
+
+
 namespace impala {
 
 static JNINativeMethod native_methods[] = {
@@ -201,6 +254,10 @@ static JNINativeMethod native_methods[] = {
   {
     (char*)"NativeLookupSymbol", (char*)"([B)[B",
     (void*)::Java_com_cloudera_impala_service_FeSupport_NativeLookupSymbol
+  },
+  {
+    (char*)"NativePrioritizeLoad", (char*)"([B)[B",
+    (void*)::Java_com_cloudera_impala_service_FeSupport_NativePrioritizeLoad
   },
 };
 

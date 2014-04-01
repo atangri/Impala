@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
+import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,7 +34,6 @@ import com.cloudera.impala.catalog.HdfsPartition.FileBlock;
 import com.cloudera.impala.catalog.HdfsTable;
 import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.common.NotImplementedException;
-import com.cloudera.impala.common.Pair;
 import com.cloudera.impala.common.PrintUtils;
 import com.cloudera.impala.common.RuntimeEnv;
 import com.cloudera.impala.thrift.TExplainLevel;
@@ -108,15 +108,9 @@ public class HdfsScanNode extends ScanNode {
   @Override
   public void init(Analyzer analyzer)
       throws InternalException, AuthorizationException {
-    // loop over all materialized slots and add predicates to conjuncts_
-    for (SlotDescriptor slotDesc: analyzer.getTupleDesc(tupleIds_.get(0)).getSlots()) {
-      ArrayList<Pair<Expr, Boolean>> bindingPredicates =
-          analyzer.getBoundPredicates(slotDesc.getId(), this);
-      for (Pair<Expr, Boolean> p: bindingPredicates) {
-        if (p.second) analyzer.markConjunctAssigned(p.first);
-        conjuncts_.add(p.first);
-      }
-    }
+    ArrayList<Expr> bindingPredicates = analyzer.getBoundPredicates(tupleIds_.get(0));
+    conjuncts_.addAll(bindingPredicates);
+
     // also add remaining unassigned conjuncts
     assignConjuncts(analyzer);
 
@@ -192,6 +186,7 @@ public class HdfsScanNode extends ScanNode {
       cardinality_ = tbl_.getNumRows();
     } else {
       cardinality_ = 0;
+      totalBytes_ = 0;
       boolean hasValidPartitionCardinality = false;
       for (HdfsPartition p: partitions_) {
         // ignore partitions with missing stats in the hope they don't matter
@@ -240,11 +235,22 @@ public class HdfsScanNode extends ScanNode {
       for (HdfsPartition.FileDescriptor fileDesc: partition.getFileDescriptors()) {
         for (THdfsFileBlock thriftBlock: fileDesc.getFileBlocks()) {
           HdfsPartition.FileBlock block = FileBlock.fromThrift(thriftBlock);
-          List<TNetworkAddress> blockNetworkAddresses = block.getNetworkAddresses();
-          if (blockNetworkAddresses.size() == 0) {
+          List<Integer> replicaHostIdxs = block.getReplicaHostIdxs();
+          if (replicaHostIdxs.size() == 0) {
             // we didn't get locations for this block; for now, just ignore the block
             // TODO: do something meaningful with that
             continue;
+          }
+
+          // Look up the network addresses of all hosts (datanodes) that contain
+          // replicas of this block.
+          List<TNetworkAddress> blockNetworkAddresses =
+              new ArrayList<TNetworkAddress>(replicaHostIdxs.size());
+          for (Integer replicaHostId: replicaHostIdxs) {
+            TNetworkAddress blockNetworkAddress =
+                partition.getTable().getNetworkAddressByIdx(replicaHostId);
+            Preconditions.checkNotNull(blockNetworkAddress);
+            blockNetworkAddresses.add(blockNetworkAddress);
           }
 
           // record host/ports and volume ids
@@ -266,9 +272,10 @@ public class HdfsScanNode extends ScanNode {
               currentLength = maxScanRangeLength;
             }
             TScanRange scanRange = new TScanRange();
-            scanRange.setHdfs_file_split(
-                new THdfsFileSplit(block.getFileName(), currentOffset,
-                  currentLength, partition.getId(), block.getFileSize()));
+            scanRange.setHdfs_file_split(new THdfsFileSplit(
+                new Path(partition.getLocation(), fileDesc.getFileName()).toString(),
+                currentOffset, currentLength, partition.getId(),
+                fileDesc.getFileLength()));
             TScanRangeLocations scanRangeLocations = new TScanRangeLocations();
             scanRangeLocations.scan_range = scanRange;
             scanRangeLocations.locations = locations;

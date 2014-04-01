@@ -87,7 +87,7 @@ class ImpalaTestBackend : public ImpalaInternalServiceIf {
 class DataStreamTest : public testing::Test {
  protected:
   DataStreamTest()
-    : runtime_state_(TUniqueId(), TUniqueId(), TQueryContext(), &exec_env_),
+    : runtime_state_(TUniqueId(), TUniqueId(), TQueryContext(), "", &exec_env_),
       next_val_(0) {
   }
 
@@ -227,7 +227,8 @@ class DataStreamTest : public testing::Test {
     TSlotDescriptor slot_desc;
     slot_desc.__set_id(0);
     slot_desc.__set_parent(0);
-    slot_desc.__set_slotType(TPrimitiveType::BIGINT);
+    ColumnType type(TYPE_BIGINT);
+    slot_desc.__set_slotType(type.ToThrift());
     slot_desc.__set_columnPos(0);
     slot_desc.__set_byteOffset(0);
     slot_desc.__set_nullIndicatorByte(0);
@@ -260,7 +261,7 @@ class DataStreamTest : public testing::Test {
     return batch;
   }
 
- void GetNextBatch(RowBatch* batch, int* next_val) {
+  void GetNextBatch(RowBatch* batch, int* next_val) {
     for (int i = 0; i < BATCH_CAPACITY; ++i) {
       TupleRow* row = batch->GetRow(i);
       int64_t* val = reinterpret_cast<int64_t*>(row->GetTuple(0)->GetSlot(0));
@@ -401,14 +402,15 @@ class DataStreamTest : public testing::Test {
 
   void Sender(int sender_num, int channel_buffer_size,
               TPartitionType::type partition_type) {
-    RuntimeState state(TUniqueId(), TUniqueId(), TQueryContext(), &exec_env_);
+    RuntimeState state(TUniqueId(), TUniqueId(), TQueryContext(), "", &exec_env_);
     state.set_desc_tbl(desc_tbl_);
     VLOG_QUERY << "create sender " << sender_num;
     const TDataStreamSink& sink =
         (partition_type == TPartitionType::UNPARTITIONED ? broadcast_sink_ : hash_sink_);
     DataStreamSender sender(
         &obj_pool_, *row_desc_, sink, dest_, channel_buffer_size);
-    EXPECT_TRUE(sender.Init(&state).ok());
+    EXPECT_TRUE(sender.Prepare(&state).ok());
+    EXPECT_TRUE(sender.Open(&state).ok());
     scoped_ptr<RowBatch> batch(CreateRowBatch());
     SenderInfo& info = sender_info_[sender_num];
     int next_val = 0;

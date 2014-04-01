@@ -20,10 +20,13 @@
 #include <arpa/inet.h>
 #include <limits.h>
 #include <sstream>
+#include <vector>
+#include <boost/algorithm/string.hpp>
 #include <boost/foreach.hpp>
 
 #include "util/debug-util.h"
 #include "util/error-util.h"
+#include <util/string-parser.h>
 
 using namespace std;
 using namespace impala;
@@ -96,6 +99,25 @@ TNetworkAddress MakeNetworkAddress(const string& hostname, int port) {
   return ret;
 }
 
+TNetworkAddress MakeNetworkAddress(const string& address) {
+  vector<string> tokens;
+  split(tokens, address, is_any_of(":"));
+  TNetworkAddress ret;
+  if (tokens.size() == 1) {
+    ret.__set_hostname(tokens[0]);
+    ret.port = 0;
+    return ret;
+  }
+  if (tokens.size() != 2) return ret;
+  ret.__set_hostname(tokens[0]);
+  StringParser::ParseResult parse_result;
+  int32_t port = StringParser::StringToInt<int32_t>(
+      tokens[1].data(), tokens[1].length(), &parse_result);
+  if (parse_result != StringParser::PARSE_SUCCESS) return ret;
+  ret.__set_port(port);
+  return ret;
+}
+
 bool IsWildcardAddress(const string& ipaddress) {
   return ipaddress == "0.0.0.0";
 }
@@ -107,7 +129,7 @@ string TNetworkAddressToString(const TNetworkAddress& address) {
 }
 
 ostream& operator<<(ostream& out, const TNetworkAddress& hostport) {
-  out << hostport.hostname << ":" << hostport.port;
+  out << hostport.hostname << ":" << dec << hostport.port;
   return out;
 }
 

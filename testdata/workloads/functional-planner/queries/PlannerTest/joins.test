@@ -73,10 +73,10 @@ from (select * from functional.alltypestiny) t1
 |  hash predicates: functional.alltypestiny.id = functional.alltypestiny.id
 |
 |--01:SCAN HDFS [functional.alltypestiny]
-|     partitions=4/4 size=920B compact
+|     partitions=4/4 size=460B compact
 |
 00:SCAN HDFS [functional.alltypestiny]
-   partitions=4/4 size=920B
+   partitions=4/4 size=460B
 ---- DISTRIBUTEDPLAN
 08:EXCHANGE [PARTITION=UNPARTITIONED]
 |
@@ -94,12 +94,12 @@ from (select * from functional.alltypestiny) t1
 |--06:EXCHANGE [PARTITION=HASH(functional.alltypestiny.id)]
 |  |
 |  01:SCAN HDFS [functional.alltypestiny]
-|     partitions=4/4 size=920B
+|     partitions=4/4 size=460B
 |
 05:EXCHANGE [PARTITION=HASH(functional.alltypestiny.id)]
 |
 00:SCAN HDFS [functional.alltypestiny]
-   partitions=4/4 size=920B
+   partitions=4/4 size=460B
 ====
 # test that our join inference recognizes that we cannot do a hash join
 select t1.*
@@ -229,10 +229,10 @@ on a.x = b.x
 |  hash predicates: 1 = 1
 |
 |--01:SCAN HDFS [functional.alltypessmall]
-|     partitions=4/4 size=12.64KB compact
+|     partitions=4/4 size=6.32KB compact
 |
 00:SCAN HDFS [functional.alltypessmall]
-   partitions=4/4 size=12.64KB
+   partitions=4/4 size=6.32KB
 ====
 # join using values() in a subquery
 select a.int_col, b.x from functional.alltypessmall a inner join
@@ -351,10 +351,10 @@ order by 2
 limit 5
 ---- PLAN
 10:TOP-N [LIMIT=5]
-|  order by: COUNT(x.day) ASC
+|  order by: count(x.day) ASC
 |
 09:AGGREGATE [FINALIZE]
-|  output: COUNT(a.day)
+|  output: count(a.day)
 |  group by: c.tinyint_col
 |
 08:SELECT
@@ -385,10 +385,10 @@ limit 5
    partitions=10/10 size=743.67KB
 ---- DISTRIBUTEDPLAN
 10:TOP-N [LIMIT=5]
-|  order by: COUNT(x.day) ASC
+|  order by: count(x.day) ASC
 |
 09:AGGREGATE [FINALIZE]
-|  output: COUNT(a.day)
+|  output: count(a.day)
 |  group by: c.tinyint_col
 |
 08:SELECT
@@ -468,7 +468,7 @@ from functional.testtbl t1, functional.testtbl t2, functional.testtbl t3
 where t1.id = t3.id and t2.id = t3.id
 ---- PLAN
 04:HASH JOIN [INNER JOIN]
-|  hash predicates: t1.id = t3.id
+|  hash predicates: t1.id = t3.id, t2.id = t3.id
 |
 |--02:SCAN HDFS [functional.testtbl t3]
 |     partitions=1/1 size=0B compact
@@ -485,7 +485,7 @@ where t1.id = t3.id and t2.id = t3.id
 07:EXCHANGE [PARTITION=UNPARTITIONED]
 |
 04:HASH JOIN [INNER JOIN, BROADCAST]
-|  hash predicates: t1.id = t3.id
+|  hash predicates: t1.id = t3.id, t2.id = t3.id
 |
 |--06:EXCHANGE [BROADCAST]
 |  |
@@ -638,7 +638,7 @@ on (a.int_col = b.int_col and b.bool_col = a.bool_col)
 |  hash predicates: a.int_col = int_col, a.bool_col = bool_col
 |
 |--02:AGGREGATE [FINALIZE]
-|  |  output: COUNT(*)
+|  |  output: count(*)
 |  |  group by: int_col, bool_col
 |  |
 |  01:SCAN HDFS [functional.alltypes]
@@ -653,13 +653,13 @@ on (a.int_col = b.int_col and b.bool_col = a.bool_col)
 |  hash predicates: a.int_col = int_col, a.bool_col = bool_col
 |
 |--05:AGGREGATE [MERGE FINALIZE]
-|  |  output: SUM(COUNT(*))
+|  |  output: sum(count(*))
 |  |  group by: int_col, bool_col
 |  |
 |  04:EXCHANGE [PARTITION=HASH(int_col,bool_col)]
 |  |
 |  02:AGGREGATE
-|  |  output: COUNT(*)
+|  |  output: count(*)
 |  |  group by: int_col, bool_col
 |  |
 |  01:SCAN HDFS [functional.alltypes]
@@ -681,7 +681,7 @@ inner join [shuffle]
 on (b.int_col = c.int_col and c.bool_col = b.bool_col)
 ---- PLAN
 05:HASH JOIN [INNER JOIN]
-|  hash predicates: a.int_col = b.int_col, a.bool_col = b.bool_col
+|  hash predicates: a.int_col = b.int_col, a.bool_col = b.bool_col, int_col = b.int_col, bool_col = b.bool_col
 |
 |--01:SCAN HDFS [functional.alltypes b]
 |     partitions=24/24 size=478.45KB compact
@@ -690,7 +690,7 @@ on (b.int_col = c.int_col and c.bool_col = b.bool_col)
 |  hash predicates: a.int_col = int_col, a.bool_col = bool_col
 |
 |--03:AGGREGATE [FINALIZE]
-|  |  output: COUNT(*)
+|  |  output: count(*)
 |  |  group by: int_col, bool_col
 |  |
 |  02:SCAN HDFS [functional.alltypes]
@@ -702,9 +702,9 @@ on (b.int_col = c.int_col and c.bool_col = b.bool_col)
 10:EXCHANGE [PARTITION=UNPARTITIONED]
 |
 05:HASH JOIN [INNER JOIN, PARTITIONED]
-|  hash predicates: a.int_col = b.int_col, a.bool_col = b.bool_col
+|  hash predicates: a.int_col = b.int_col, a.bool_col = b.bool_col, int_col = b.int_col, bool_col = b.bool_col
 |
-|--09:EXCHANGE [PARTITION=HASH(b.int_col,b.bool_col)]
+|--09:EXCHANGE [PARTITION=HASH(b.int_col,b.bool_col,b.int_col,b.bool_col)]
 |  |
 |  01:SCAN HDFS [functional.alltypes b]
 |     partitions=24/24 size=478.45KB
@@ -713,13 +713,13 @@ on (b.int_col = c.int_col and c.bool_col = b.bool_col)
 |  hash predicates: a.int_col = int_col, a.bool_col = bool_col
 |
 |--07:AGGREGATE [MERGE FINALIZE]
-|  |  output: SUM(COUNT(*))
+|  |  output: sum(count(*))
 |  |  group by: int_col, bool_col
 |  |
 |  06:EXCHANGE [PARTITION=HASH(int_col,bool_col)]
 |  |
 |  03:AGGREGATE
-|  |  output: COUNT(*)
+|  |  output: count(*)
 |  |  group by: int_col, bool_col
 |  |
 |  02:SCAN HDFS [functional.alltypes]
@@ -728,5 +728,19 @@ on (b.int_col = c.int_col and c.bool_col = b.bool_col)
 08:EXCHANGE [PARTITION=HASH(a.int_col,a.bool_col)]
 |
 00:SCAN HDFS [functional.alltypes a]
+   partitions=24/24 size=478.45KB
+====
+# tests that all predicates from the On-clause are applied (IMPALA-805)
+select 1 from functional.alltypes a
+join functional.alltypes b
+on a.int_col = b.id and a.int_col = b.int_col and a.smallint_col = b.int_col
+---- PLAN
+02:HASH JOIN [INNER JOIN]
+|  hash predicates: b.id = a.int_col, b.int_col = a.int_col, b.int_col = a.smallint_col
+|
+|--00:SCAN HDFS [functional.alltypes a]
+|     partitions=24/24 size=478.45KB compact
+|
+01:SCAN HDFS [functional.alltypes b]
    partitions=24/24 size=478.45KB
 ====

@@ -25,23 +25,18 @@
 using namespace std;
 using namespace impala;
 
+DEFINE_bool(load_catalog_in_background, true,
+    "If true, loads catalog metadata in the background. If false, metadata is loaded "
+    "lazily (on access).");
+DEFINE_int32(num_metadata_loading_threads, 16,
+    "(Advanced) The number of metadata loading threads (degree of parallelism) to use "
+    "when loading catalog metadata.");
+
 DECLARE_int32(non_impala_java_vlog);
 
-// Describes one method to look up in a Catalog object
-struct Catalog::MethodDescriptor {
-  // Name of the method, case must match
-  const string name;
-
-  // JNI-style method signature
-  const string signature;
-
-  // Handle to the method, set by LoadJNIMethod
-  jmethodID* method_id;
-};
-
 Catalog::Catalog() {
-  MethodDescriptor methods[] = {
-    {"<init>", "(II)V", &catalog_ctor_},
+  JniMethodDescriptor methods[] = {
+    {"<init>", "(ZIII)V", &catalog_ctor_},
     {"updateCatalog", "([B)[B", &update_metastore_id_},
     {"execDdl", "([B)[B", &exec_ddl_id_},
     {"resetMetadata", "([B)[B", &reset_metadata_id_},
@@ -49,7 +44,9 @@ Catalog::Catalog() {
     {"getDbNames", "([B)[B", &get_db_names_id_},
     {"getFunctions", "([B)[B", &get_functions_id_},
     {"getCatalogObject", "([B)[B", &get_catalog_object_id_},
-    {"getCatalogObjects", "(J)[B", &get_catalog_objects_id_}};
+    {"getCatalogObjects", "(J)[B", &get_catalog_objects_id_},
+    {"getCatalogVersion", "()J", &get_catalog_version_id_},
+    {"prioritizeLoad", "([B)V", &prioritize_load_id_}};
 
   JNIEnv* jni_env = getJNIEnv();
   // Create an instance of the java class JniCatalog
@@ -58,24 +55,30 @@ Catalog::Catalog() {
 
   uint32_t num_methods = sizeof(methods) / sizeof(methods[0]);
   for (int i = 0; i < num_methods; ++i) {
-    LoadJniMethod(jni_env, &(methods[i]));
+    EXIT_IF_ERROR(JniUtil::LoadJniMethod(jni_env, catalog_class_, &(methods[i])));
   }
 
+  jboolean load_in_background = FLAGS_load_catalog_in_background;
+  jint num_metadata_loading_threads = FLAGS_num_metadata_loading_threads;
   jobject catalog = jni_env->NewObject(catalog_class_, catalog_ctor_,
-      FlagToTLogLevel(FLAGS_v), FlagToTLogLevel(FLAGS_non_impala_java_vlog));
+      load_in_background, num_metadata_loading_threads, FlagToTLogLevel(FLAGS_v),
+      FlagToTLogLevel(FLAGS_non_impala_java_vlog));
   EXIT_IF_EXC(jni_env);
   EXIT_IF_ERROR(JniUtil::LocalToGlobalRef(jni_env, catalog, &catalog_));
-}
-
-void Catalog::LoadJniMethod(JNIEnv* jni_env, MethodDescriptor* descriptor) {
-  (*descriptor->method_id) = jni_env->GetMethodID(catalog_class_,
-      descriptor->name.c_str(), descriptor->signature.c_str());
-  EXIT_IF_EXC(jni_env);
 }
 
 Status Catalog::GetCatalogObject(const TCatalogObject& req,
     TCatalogObject* resp) {
   return JniUtil::CallJniMethod(catalog_, get_catalog_object_id_, req, resp);
+}
+
+
+Status Catalog::GetCatalogVersion(long* version) {
+  JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
+  *version = jni_env->CallLongMethod(catalog_, get_catalog_version_id_);
+  return Status::OK;
 }
 
 Status Catalog::GetAllCatalogObjects(long from_version,
@@ -124,4 +127,8 @@ Status Catalog::GetTableNames(const string& db, const string* pattern,
 Status Catalog::GetFunctions(const TGetFunctionsRequest& request,
     TGetFunctionsResponse *response) {
   return JniUtil::CallJniMethod(catalog_, get_functions_id_, request, response);
+}
+
+Status Catalog::PrioritizeLoad(const TPrioritizeLoadRequest& req) {
+  return JniUtil::CallJniMethod(catalog_, prioritize_load_id_, req);
 }

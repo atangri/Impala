@@ -101,10 +101,6 @@ file(MAKE_DIRECTORY ${PYTHON_OUTPUT_DIR})
 set(JAVA_ARGS ${THRIFT_INCLUDE_DIR_OPTION} --gen java:hashcode -o ${FE_OUTPUT_DIR})
 set(PYTHON_ARGS ${THRIFT_INCLUDE_DIR_OPTION} -r --gen py -o ${PYTHON_OUTPUT_DIR})
 
-set (GENERATES_SRC_FILES
-  Opcodes.thrift
-)
-
 set (SRC_FILES
   beeswax.thrift
   CatalogInternalService.thrift
@@ -119,20 +115,19 @@ set (SRC_FILES
   ImpalaInternalService.thrift
   ImpalaService.thrift
   JniCatalog.thrift
+  Llama.thrift
   Logging.thrift
   NetworkTest.thrift
   PlanNodes.thrift
   Planner.thrift
   Partitions.thrift
   parquet.thrift
+  ResourceBrokerService.thrift
   RuntimeProfile.thrift
   StatestoreService.thrift
   Status.thrift
   Types.thrift
-  ${GENERATES_SRC_FILES}
 )
-
-set_source_files_properties(${GENERATES_SRC_FILES} PROPERTIES GENERATED TRUE)
 
 # Create a build command for each of the thrift src files and generate
 # a list of files they produce

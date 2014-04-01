@@ -69,7 +69,7 @@ public class View extends Table {
               String.format("Failed to load metadata for table '%s' due to unsupported " +
               "column type '%s' in column '%s'", getName(), s.getType(), s.getName()));
         }
-        PrimitiveType type = getPrimitiveType(s.getType());
+        ColumnType type = parseColumnType(s);
         Column col = new Column(s.getName(), type, s.getComment(), i);
         colsByPos_.add(col);
         colsByName_.put(s.getName(), col);
@@ -86,7 +86,7 @@ public class View extends Table {
   }
 
   @Override
-  public void loadFromThrift(TTable t) throws TableLoadingException {
+  protected void loadFromThrift(TTable t) throws TableLoadingException {
     super.loadFromThrift(t);
     initViewDef();
   }

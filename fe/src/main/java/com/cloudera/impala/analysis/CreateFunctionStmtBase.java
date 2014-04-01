@@ -18,15 +18,13 @@ import java.util.HashMap;
 
 import com.cloudera.impala.authorization.Privilege;
 import com.cloudera.impala.catalog.AuthorizationException;
+import com.cloudera.impala.catalog.Catalog;
+import com.cloudera.impala.catalog.ColumnType;
+import com.cloudera.impala.catalog.Db;
 import com.cloudera.impala.catalog.Function;
 import com.cloudera.impala.common.AnalysisException;
-import com.cloudera.impala.common.InternalException;
-import com.cloudera.impala.service.FeSupport;
 import com.cloudera.impala.thrift.TCreateFunctionParams;
 import com.cloudera.impala.thrift.TFunctionBinaryType;
-import com.cloudera.impala.thrift.TSymbolLookupParams;
-import com.cloudera.impala.thrift.TSymbolLookupResult;
-import com.google.common.base.Preconditions;
 
 /**
  * Base class for CREATE [] FUNCTION.
@@ -36,6 +34,8 @@ public class CreateFunctionStmtBase extends StatementBase {
   public enum OptArg {
     COMMENT,
     SYMBOL,           // Only used for Udfs
+    PREPARE_FN,       // Only used for Udfs
+    CLOSE_FN,         // Only used for Udfs
     UPDATE_FN,        // Only used for Udas
     INIT_FN,          // Only used for Udas
     SERIALIZE_FN,     // Only used for Udas
@@ -63,55 +63,11 @@ public class CreateFunctionStmtBase extends StatementBase {
   public String getComment() { return optArgs_.get(OptArg.COMMENT); }
   public boolean getIfNotExists() { return ifNotExists_; }
 
-  protected TCreateFunctionParams toThrift() {
+  public TCreateFunctionParams toThrift() {
     TCreateFunctionParams params = new TCreateFunctionParams(fn_.toThrift());
     params.setIf_not_exists(getIfNotExists());
+    params.setFn(fn_.toThrift());
     return params;
-  }
-
-  // Returns the resolved symbol in the binary. The BE will do a lookup of 'symbol'
-  // in the binary and try to resolve unmangled names.
-  // If this function is expecting a return argument, retArgType is that type. It should
-  // be null if this function isn't expecting a return argument.
-  protected String lookupSymbol(String symbol, ColumnType retArgType, boolean hasVarArgs,
-      ColumnType... argTypes) throws AnalysisException {
-    if (symbol.length() == 0) {
-      throw new AnalysisException(
-          "Could not find symbol '' in: " + fn_.getLocation().getLocation());
-    }
-    if (fn_.getBinaryType() == TFunctionBinaryType.HIVE) {
-      // TODO: add this when hive udfs go in.
-      return symbol;
-    }
-    Preconditions.checkState(fn_.getBinaryType() == TFunctionBinaryType.NATIVE ||
-        fn_.getBinaryType() == TFunctionBinaryType.IR);
-
-    TSymbolLookupParams lookup = new TSymbolLookupParams();
-    lookup.location =  fn_.getLocation().toString();
-    lookup.symbol = symbol;
-    lookup.fn_binary_type = fn_.getBinaryType();
-    lookup.arg_types = ColumnType.toThrift(argTypes);
-    lookup.has_var_args = hasVarArgs;
-    if (retArgType != null) lookup.setRet_arg_type(retArgType.toThrift());
-
-    try {
-      TSymbolLookupResult result = FeSupport.LookupSymbol(lookup);
-      switch (result.result_code) {
-        case SYMBOL_FOUND:
-          return result.symbol;
-        case BINARY_NOT_FOUND:
-          throw new AnalysisException(
-              "Could not load binary: " + fn_.getLocation().getLocation() + "\n" +
-              result.error_msg);
-        case SYMBOL_NOT_FOUND:
-          throw new AnalysisException(result.error_msg);
-        default:
-          // Should never get here.
-          throw new AnalysisException("Internal Error");
-      }
-    } catch (InternalException e) {
-      throw new AnalysisException("Could not find symbol.", e);
-    }
   }
 
   // Returns optArg[key], first validating that it is set.
@@ -162,14 +118,23 @@ public class CreateFunctionStmtBase extends StatementBase {
 
     // Validate function name is legal
     fn_.getFunctionName().analyze(analyzer);
-
-    // Validate DB is legal
-    String dbName = analyzer.getTargetDbName(fn_.getFunctionName());
-    fn_.getFunctionName().setDb(dbName);
-    if (analyzer.getCatalog().getDb(
-        dbName, analyzer.getUser(), Privilege.CREATE) == null) {
-      throw new AnalysisException(Analyzer.DB_DOES_NOT_EXIST_ERROR_MSG + dbName);
+    Db builtinsDb = analyzer.getCatalog().getDb(Catalog.BUILTINS_DB);
+    if (builtinsDb.containsFunction(fn_.getName())) {
+      throw new AnalysisException("Function cannot have the same name as a builtin: " +
+          fn_.getFunctionName().getFunction());
     }
+
+    // Validate function arguments
+    for (ColumnType t: fn_.getArgs()) {
+      t.analyze();
+    }
+    fn_.getReturnType().analyze();
+
+    if (analyzer.getCatalog().getDb(
+        fn_.dbName(), analyzer.getUser(), Privilege.CREATE) == null) {
+      throw new AnalysisException(Analyzer.DB_DOES_NOT_EXIST_ERROR_MSG + fn_.dbName());
+    }
+
     Function existingFn = analyzer.getCatalog().getFunction(
         fn_, Function.CompareMode.IS_INDISTINGUISHABLE);
     if (existingFn != null && !ifNotExists_) {

@@ -19,7 +19,6 @@
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include "codegen/llvm-codegen.h"
 #include "exprs/anyval-util.h"
-#include "exprs/opcode-registry.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/lib-cache.h"
 #include "runtime/runtime-state.h"
@@ -33,15 +32,15 @@ using namespace std;
 
 NativeUdfExpr::NativeUdfExpr(const TExprNode& node)
   : Expr(node),
-    udf_type_(node.fn_call_expr.fn.binary_type),
-    hdfs_location_(node.fn_call_expr.fn.hdfs_location),
-    symbol_name_(node.fn_call_expr.fn.scalar_fn.symbol),
-    vararg_start_idx_(node.fn_call_expr.__isset.vararg_start_idx ?
-        node.fn_call_expr.vararg_start_idx : -1),
+    vararg_start_idx_(node.__isset.vararg_start_idx ?
+        node.vararg_start_idx : -1),
     udf_wrapper_(NULL),
+    prepare_fn_(NULL),
+    close_fn_(NULL),
     varargs_input_(NULL) {
+  is_udf_call_ = true;
   DCHECK_EQ(node.node_type, TExprNodeType::FUNCTION_CALL);
-  DCHECK_NE(udf_type_, TFunctionBinaryType::HIVE);
+  DCHECK_NE(fn_.binary_type, TFunctionBinaryType::HIVE);
 }
 
 NativeUdfExpr::~NativeUdfExpr() {
@@ -60,7 +59,7 @@ typedef TimestampVal (*TimestampUdfWrapper)(int8_t*, TupleRow*);
 
 void* NativeUdfExpr::ComputeFn(Expr* e, TupleRow* row) {
   NativeUdfExpr* udf_expr = reinterpret_cast<NativeUdfExpr*>(e);
-  switch (e->type()) {
+  switch (e->type().type) {
     case TYPE_BOOLEAN: {
       BooleanUdfWrapper fn = reinterpret_cast<BooleanUdfWrapper>(udf_expr->udf_wrapper_);
       BooleanVal v = fn(NULL, row);
@@ -133,11 +132,96 @@ void* NativeUdfExpr::ComputeFn(Expr* e, TupleRow* row) {
   return NULL;
 }
 
+AnyVal* NativeUdfExpr::GetConstVal() {
+  if (!IsConstant()) return NULL;
+  if (constant_val_.get() != NULL) return constant_val_.get();
+
+  switch (type_.type) {
+    case TYPE_BOOLEAN: {
+      BooleanUdfWrapper fn = reinterpret_cast<BooleanUdfWrapper>(udf_wrapper_);
+      BooleanVal v = fn(NULL, NULL);
+      constant_val_.reset(new BooleanVal(v));
+      break;
+    }
+    case TYPE_TINYINT: {
+      TinyIntUdfWrapper fn = reinterpret_cast<TinyIntUdfWrapper>(udf_wrapper_);
+      TinyIntVal v = fn(NULL, NULL);
+      constant_val_.reset(new TinyIntVal(v));
+      break;
+    }
+    case TYPE_SMALLINT: {
+      SmallIntUdfWrapper fn = reinterpret_cast<SmallIntUdfWrapper>(udf_wrapper_);
+      SmallIntVal v = fn(NULL, NULL);
+      constant_val_.reset(new SmallIntVal(v));
+      break;
+    }
+    case TYPE_INT: {
+      IntUdfWrapper fn = reinterpret_cast<IntUdfWrapper>(udf_wrapper_);
+      IntVal v = fn(NULL, NULL);
+      constant_val_.reset(new IntVal(v));
+      break;
+    }
+    case TYPE_BIGINT: {
+      BigIntUdfWrapper fn = reinterpret_cast<BigIntUdfWrapper>(udf_wrapper_);
+      BigIntVal v = fn(NULL, NULL);
+      constant_val_.reset(new BigIntVal(v));
+      break;
+    }
+    case TYPE_FLOAT: {
+      FloatUdfWrapper fn = reinterpret_cast<FloatUdfWrapper>(udf_wrapper_);
+      FloatVal v = fn(NULL, NULL);
+      constant_val_.reset(new FloatVal(v));
+      break;
+    }
+    case TYPE_DOUBLE: {
+      DoubleUdfWrapper fn = reinterpret_cast<DoubleUdfWrapper>(udf_wrapper_);
+      DoubleVal v = fn(NULL, NULL);
+      constant_val_.reset(new DoubleVal(v));
+      break;
+    }
+    case TYPE_STRING: {
+      StringUdfWrapper fn = reinterpret_cast<StringUdfWrapper>(udf_wrapper_);
+      StringVal v = fn(NULL, NULL);
+      constant_val_.reset(new StringVal(v));
+      break;
+    }
+    case TYPE_TIMESTAMP: {
+      TimestampUdfWrapper fn = reinterpret_cast<TimestampUdfWrapper>(udf_wrapper_);
+      TimestampVal v = fn(NULL, NULL);
+      constant_val_.reset(new TimestampVal(v));
+      break;
+    }
+    default:
+      DCHECK(false) << "Type not implemented: " << type();
+  }
+  return constant_val_.get();
+}
+
 Status NativeUdfExpr::Prepare(RuntimeState* state, const RowDescriptor& desc) {
   RETURN_IF_ERROR(Expr::PrepareChildren(state, desc));
 
+  // Udfs always require some amount of codegen.
+  if (state->codegen() == NULL) state->CreateCodegen();
+
+  if (fn_.scalar_fn.symbol.empty()) {
+    // This path is intended to only be used during development to test FE
+    // code before the BE has implemented the function.
+    // Having the failure in the BE (rather than during analysis) allows for
+    // better FE testing.
+    DCHECK_EQ(fn_.binary_type, TFunctionBinaryType::BUILTIN);
+    stringstream ss;
+    ss << "Function " << fn_.name.function_name << " is not implemented.";
+    return Status(ss.str());
+  }
+
+  vector<FunctionContext::TypeDesc> arg_types(children_.size());
+  for (int i = 0; i < children_.size(); ++i) {
+    AnyValUtil::ColumnTypeToTypeDesc(children_[i]->type_, &arg_types[i]);
+  }
+
   // TODO: this should come from the ExprContext
-  udf_context_.reset(FunctionContextImpl::CreateContext(state, state->udf_pool()));
+  udf_context_.reset(
+      FunctionContextImpl::CreateContext(state, state->udf_pool(), arg_types));
 
   if (vararg_start_idx_ != -1) {
     // Allocate a scratch buffer for all the variable args.
@@ -149,12 +233,74 @@ Status NativeUdfExpr::Prepare(RuntimeState* state, const RowDescriptor& desc) {
     varargs_input_ = new uint8_t[var_args_buffer_size];
   }
 
+  if (fn_.binary_type == TFunctionBinaryType::IR) {
+    string local_path;
+    RETURN_IF_ERROR(LibCache::instance()->GetLocalLibPath(
+          fn_.hdfs_location, LibCache::TYPE_IR, &local_path));
+    // Link the UDF module into this query's main module (essentially copy the UDF module
+    // into the main module) so the UDF's functions are available in the main module.
+    RETURN_IF_ERROR(state->codegen()->LinkModule(local_path));
+  }
+
   llvm::Function* ir_udf_wrapper;
   RETURN_IF_ERROR(GetIrComputeFn(state, &ir_udf_wrapper));
   DCHECK(state->codegen() != NULL);
   state->codegen()->AddFunctionToJit(ir_udf_wrapper, &udf_wrapper_);
   compute_fn_ = ComputeFn;
+
+  if (fn_.scalar_fn.__isset.prepare_fn_symbol) {
+    RETURN_IF_ERROR(GetFunction(state, fn_.scalar_fn.prepare_fn_symbol,
+        reinterpret_cast<void**>(&prepare_fn_)));
+  }
+  if (fn_.scalar_fn.__isset.close_fn_symbol) {
+    RETURN_IF_ERROR(GetFunction(state, fn_.scalar_fn.close_fn_symbol,
+        reinterpret_cast<void**>(&close_fn_)));
+  }
+
   return Status::OK;
+}
+
+Status NativeUdfExpr::Open(RuntimeState* state) {
+  // Opens and inits children
+  RETURN_IF_ERROR(Expr::Open(state));
+
+  vector<AnyVal*> constant_args;
+  for (int i = 0; i < children_.size(); ++i) {
+    constant_args.push_back(children_[i]->GetConstVal());
+  }
+  udf_context_->impl()->SetConstantArgs(constant_args);
+
+  if (prepare_fn_ != NULL) {
+    // TODO: Right now only THREAD_LOCAL is implemented, but once the expr refactoring
+    // goes in Open() will need to take a FunctionStateScope argument that we pass to the
+    // UDF's prepare function. The FunctionContext will also come from an ExprContext
+    // instead of being baked into the NativeUdfExpr.
+    prepare_fn_(udf_context_.get(), FunctionContext::THREAD_LOCAL);
+    if (udf_context_->has_error()) return Status(udf_context_->error_msg());
+  }
+  return Status::OK;
+}
+
+void NativeUdfExpr::Close(RuntimeState* state) {
+  if (close_fn_ != NULL && opened_) {
+    DCHECK(!udf_context_->impl()->closed()) << "Expr::Close() called twice";
+    close_fn_(udf_context_.get(), FunctionContext::THREAD_LOCAL);
+  }
+
+  if (udf_context_.get() != NULL) {
+    bool previous_error = udf_context_->has_error();
+    udf_context_->impl()->Close();
+    if (!previous_error && udf_context_->has_error()) {
+      // TODO: revisit this. Errors logged in close will likely not be displayed to the
+      // shell, and we may want to automatically log bad query statuses set in close
+      // rather than manually doing it here and in AggFnEvaluator.
+      stringstream ss;
+      ss << "UDF ERROR: " << udf_context_->error_msg();
+      state->LogError(ss.str());
+    }
+  }
+
+  Expr::Close(state);
 }
 
 // Dynamically loads the pre-compiled UDF and codegens a function that calls each child's
@@ -185,8 +331,6 @@ Status NativeUdfExpr::Prepare(RuntimeState* state, const RowDescriptor& desc) {
 //        i64* inttoptr (i64 89111072 to i64*))
 //   ret { i8, double } %result
 Status NativeUdfExpr::GetIrComputeFn(RuntimeState* state, llvm::Function** fn) {
-  // Udfs always require some amount of codegen.
-  if (state->codegen() == NULL) state->CreateCodegen();
   LlvmCodeGen* codegen = state->codegen();
   DCHECK(codegen != NULL);
   llvm::Function* udf;
@@ -271,19 +415,24 @@ Status NativeUdfExpr::GetIrComputeFn(RuntimeState* state, llvm::Function** fn) {
 Status NativeUdfExpr::GetUdf(RuntimeState* state, llvm::Function** udf) {
   LlvmCodeGen* codegen = state->codegen();
   DCHECK(codegen != NULL);
-  if (udf_type_ == TFunctionBinaryType::NATIVE ||
-      (udf_type_ == TFunctionBinaryType::BUILTIN && !state->codegen_enabled())) {
+  if (fn_.binary_type == TFunctionBinaryType::NATIVE ||
+      (fn_.binary_type == TFunctionBinaryType::BUILTIN && !state->codegen_enabled())) {
     // In this path, we are code that has been statically compiled to assembly.
     // This can either be a UDF implemented in a .so or a builtin using the UDF
     // interface with the code in impalad.
-    void* udf_ptr;
-    if (udf_type_ == TFunctionBinaryType::NATIVE) {
-      RETURN_IF_ERROR(state->lib_cache()->GetSoFunctionPtr(
-          state->fs_cache(), hdfs_location_, symbol_name_, &udf_ptr));
-    } else {
-      udf_ptr = OpcodeRegistry::Instance()->GetFunctionPtr(opcode_);
+    void* fn_ptr;
+    Status status = LibCache::instance()->GetSoFunctionPtr(
+        fn_.hdfs_location, fn_.scalar_fn.symbol, &fn_ptr, &cache_entry_);
+    if (!status.ok() && fn_.binary_type == TFunctionBinaryType::BUILTIN) {
+      // Builtins symbols should exist unless there is a version mismatch.
+      stringstream ss;
+      ss << "Builtin '" << fn_.name.function_name << "' with symbol '"
+         << fn_.scalar_fn.symbol << "' does not exist. "
+         << "Verify that all your impalads are the same version.";
+      status.AddErrorMsg(ss.str());
     }
-    DCHECK(udf_ptr != NULL);
+    RETURN_IF_ERROR(status);
+    DCHECK(fn_ptr != NULL);
 
     // Convert UDF function pointer to llvm::Function*
     // First generate the llvm::FunctionType* corresponding to the UDF.
@@ -309,48 +458,63 @@ Status NativeUdfExpr::GetUdf(RuntimeState* state, llvm::Function** udf) {
     // declaration, not a definition, since we do not create any basic blocks or
     // instructions in it.
     *udf = llvm::Function::Create(
-        udf_type, llvm::GlobalValue::ExternalLinkage, symbol_name_, codegen->module());
+        udf_type, llvm::GlobalValue::ExternalLinkage,
+        fn_.scalar_fn.symbol, codegen->module());
 
     // Associate the dynamically loaded function pointer with the Function* we
     // defined. This tells LLVM where the compiled function definition is located in
     // memory.
-    codegen->execution_engine()->addGlobalMapping(*udf, udf_ptr);
-  } else if (udf_type_ == TFunctionBinaryType::BUILTIN) {
+    codegen->execution_engine()->addGlobalMapping(*udf, fn_ptr);
+  } else if (fn_.binary_type == TFunctionBinaryType::BUILTIN) {
     // In this path, we're running a builtin with the UDF interface. The IR is
     // in the llvm module.
     DCHECK(state->codegen_enabled());
-    const string& symbol = OpcodeRegistry::Instance()->GetFunctionSymbol(opcode_);
-    *udf = codegen->module()->getFunction(symbol);
+    *udf = codegen->module()->getFunction(fn_.scalar_fn.symbol);
     if (*udf == NULL) {
+      // Builtins symbols should exist unless there is a version mismatch.
       stringstream ss;
-      ss << "Could not load builtin " << opcode_ << " with symbol: " << symbol;
+      ss << "Builtin '" << fn_.name.function_name << "' with symbol '"
+         << fn_.scalar_fn.symbol << "' does not exist. "
+         << "Verify that all your impalads are the same version.";
       return Status(ss.str());
     }
   } else {
     // We're running a IR UDF.
-    DCHECK_EQ(udf_type_, TFunctionBinaryType::IR);
-    string local_path;
-    RETURN_IF_ERROR(state->lib_cache()->GetLocalLibPath(
-          state->fs_cache(), hdfs_location_, LibCache::TYPE_IR, &local_path));
-
-    // Link the UDF module into this query's main module (essentially copy the UDF module
-    // into the main module) so the UDF function is available for inlining in the main
-    // module.
-    RETURN_IF_ERROR(codegen->LinkModule(local_path));
-    *udf = codegen->module()->getFunction(symbol_name_);
+    DCHECK_EQ(fn_.binary_type, TFunctionBinaryType::IR);
+    *udf = codegen->module()->getFunction(fn_.scalar_fn.symbol);
     if (*udf == NULL) {
       stringstream ss;
-      ss << "Unable to locate function " << symbol_name_
-         << " from LLVM module " << hdfs_location_;
+      ss << "Unable to locate function " << fn_.scalar_fn.symbol
+         << " from LLVM module " << fn_.hdfs_location;
       return Status(ss.str());
     }
   }
   return Status::OK;
 }
 
+Status NativeUdfExpr::GetFunction(RuntimeState* state, const string& symbol, void** fn) {
+  if (fn_.binary_type == TFunctionBinaryType::NATIVE ||
+      fn_.binary_type == TFunctionBinaryType::BUILTIN) {
+    return LibCache::instance()->GetSoFunctionPtr(fn_.hdfs_location, symbol, fn,
+                                                  &cache_entry_);
+  } else {
+    DCHECK_EQ(fn_.binary_type, TFunctionBinaryType::IR);
+    llvm::Function* ir_fn = state->codegen()->module()->getFunction(symbol);
+    if (ir_fn == NULL) {
+      stringstream ss;
+      ss << "Unable to locate function " << symbol
+         << " from LLVM module " << fn_.hdfs_location;
+      return Status(ss.str());
+    }
+    state->codegen()->AddFunctionToJit(ir_fn, fn);
+    return Status::OK;
+  }
+}
+
 string NativeUdfExpr::DebugString() const {
   stringstream out;
-  out << "NativeUdfExpr(udf_type=" << udf_type_ << " location=" << hdfs_location_
-      << " symbol_name=" << symbol_name_ << Expr::DebugString() << ")";
+  out << "NativeUdfExpr(udf_type=" << fn_.binary_type
+      << " location=" << fn_.hdfs_location
+      << " symbol_name=" << fn_.scalar_fn.symbol << Expr::DebugString() << ")";
   return out.str();
 }

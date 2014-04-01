@@ -19,21 +19,18 @@
 #include "common/logging.h"
 #include "util/debug-util.h"
 #include "util/error-util.h"
+#include "util/fe-test-info.h"
 
 using namespace std;
 using namespace boost;
 
 namespace impala {
 
-HdfsFsCache::~HdfsFsCache() {
-  for (HdfsFsMap::iterator i = fs_map_.begin(); i != fs_map_.end(); ++i) {
-    int status = hdfsDisconnect(i->second);
-    if (status != 0) {
-      string error_msg = GetStrErrMsg();
-      LOG(ERROR) << "hdfsDisconnect(\"" << i->first.first << "\", " << i->first.second
-                 << ") failed: " << error_msg;
-    }
-  }
+scoped_ptr<HdfsFsCache> HdfsFsCache::instance_;
+
+void HdfsFsCache::Init() {
+  DCHECK(HdfsFsCache::instance_.get() == NULL);
+  HdfsFsCache::instance_.reset(new HdfsFsCache());
 }
 
 hdfsFS HdfsFsCache::GetConnection(const string& host, int port) {

@@ -37,7 +37,7 @@ enum TCatalogObjectType {
 enum TTableType {
   HDFS_TABLE,
   HBASE_TABLE,
-  VIEW
+  VIEW,
 }
 
 enum THdfsFileFormat {
@@ -124,7 +124,7 @@ struct TColumnStats {
 
 struct TColumn {
   1: required string columnName
-  2: required Types.TPrimitiveType columnType
+  2: required Types.TColumnType columnType
   3: optional string comment
   // Stats for this table, if any are available.
   4: optional TColumnStats col_stats
@@ -141,31 +141,36 @@ struct TColumn {
 
 // Represents a block in an HDFS file
 struct THdfsFileBlock {
-  // Name of the file
-  1: required string file_name
-
-  // Size of the file
-  2: required i64 file_size
-
   // Offset of this block within the file
-  3: required i64 offset
+  1: required i64 offset
 
   // Total length of the block
-  4: required i64 length
+  2: required i64 length
 
-  // List of datanodes network addresses (IP address and port) that contain this block
-  5: required list<Types.TNetworkAddress> network_addresses
+  // Hosts that contain replicas of this block. Each value in the list is an index in to
+  // the network_addresses list of THdfsTable.
+  3: required list<i32> replica_host_idxs
 
   // The list of disk ids for the file block. May not be set if disk ids are not supported
-  6: optional list<i32> disk_ids
+  4: optional list<i32> disk_ids
 }
 
-// Represents an HDFS file
+// Represents an HDFS file in a partition.
 struct THdfsFileDesc {
-  1: required string path
+  // The name of the file (not the full path). The parent path is assumed to be the
+  // 'location' of the THdfsPartition this file resides within.
+  1: required string file_name
+
+  // The total length of the file, in bytes.
   2: required i64 length
+
+  // The type of compression used for this file.
   3: required THdfsCompression compression
+
+  // The last modified time of the file.
   4: required i64 last_modification_time
+
+  // List of THdfsFileBlocks that make up this file.
   5: required list<THdfsFileBlock> file_blocks
 }
 
@@ -209,6 +214,11 @@ struct THdfsTable {
 
   // map from partition id to partition metadata
   4: required map<i64, THdfsPartition> partitions
+
+  // Each TNetworkAddress is a datanode which contains blocks of a file in the table.
+  // Used so that each THdfsFileBlock can just reference an index in this list rather
+  // than duplicate the list of network address, which helps reduce memory usage.
+  7: optional list<Types.TNetworkAddress> network_addresses
 }
 
 struct THBaseTable {
@@ -223,10 +233,10 @@ struct THBaseTable {
 
 // Represents a table or view.
 struct TTable {
-  // Name of the parent database
+  // Name of the parent database. Case insensitive, expected to be stored as lowercase.
   1: required string db_name
 
-  // Unqualified table name
+  // Unqualified table name. Case insensitive, expected to be stored as lowercase.
   2: required string tbl_name
 
   // Set if there were any errors loading the Table metadata. The remaining fields in
@@ -266,7 +276,7 @@ struct TTable {
 
 // Represents a database.
 struct TDatabase {
-  // Name of the database
+  // Name of the database. Case insensitive, expected to be stored as lowercase.
   1: required string db_name
 
   // The HDFS location new tables will default their base directory to

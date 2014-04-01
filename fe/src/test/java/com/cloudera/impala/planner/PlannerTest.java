@@ -19,7 +19,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.cloudera.impala.authorization.AuthorizationConfig;
-import com.cloudera.impala.catalog.Catalog;
 import com.cloudera.impala.catalog.CatalogException;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.ImpalaException;
@@ -27,6 +26,7 @@ import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.common.NotImplementedException;
 import com.cloudera.impala.common.RuntimeEnv;
 import com.cloudera.impala.service.Frontend;
+import com.cloudera.impala.testutil.ImpaladTestCatalog;
 import com.cloudera.impala.testutil.TestFileParser;
 import com.cloudera.impala.testutil.TestFileParser.Section;
 import com.cloudera.impala.testutil.TestFileParser.TestCase;
@@ -39,16 +39,15 @@ import com.cloudera.impala.thrift.THdfsFileSplit;
 import com.cloudera.impala.thrift.TQueryContext;
 import com.cloudera.impala.thrift.TQueryExecRequest;
 import com.cloudera.impala.thrift.TScanRangeLocations;
-import com.cloudera.impala.thrift.TStmtType;
 import com.google.common.base.Joiner;
-import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
 public class PlannerTest {
   private final static Logger LOG = LoggerFactory.getLogger(PlannerTest.class);
   private final static boolean GENERATE_OUTPUT_FILE = true;
-
-  private static Frontend frontend_;
+  private static Frontend frontend_ = new Frontend(
+      AuthorizationConfig.createAuthDisabledConfig(),
+      new ImpaladTestCatalog(AuthorizationConfig.createAuthDisabledConfig()));
   private final String testDir_ = "functional-planner/queries/PlannerTest";
   private final String outDir_ = "/tmp/PlannerTest/";
 
@@ -56,8 +55,6 @@ public class PlannerTest {
   public static void setUp() throws Exception {
     // Use 8 cores for resource estimation.
     RuntimeEnv.INSTANCE.setNumCores(8);
-    frontend_ = new Frontend(Catalog.CatalogInitStrategy.LAZY,
-        AuthorizationConfig.createAuthDisabledConfig());
   }
 
   @AfterClass
@@ -190,9 +187,7 @@ public class PlannerTest {
     actualOutput.append(Section.PLAN.getHeader() + "\n");
     try {
       execRequest = frontend_.createExecRequest(queryCtxt, explainBuilder);
-      Preconditions.checkState(execRequest.stmt_type == TStmtType.DML
-          || execRequest.stmt_type == TStmtType.QUERY);
-      String explainStr = removeResourceEstimates(explainBuilder.toString());
+      String explainStr = removeExplainHeader(explainBuilder.toString());
       actualOutput.append(explainStr);
       if (!isImplemented) {
         errorLog.append(
@@ -205,8 +200,11 @@ public class PlannerTest {
           errorLog.append("section " + Section.PLAN.toString() + " of query:\n" + query
               + "\n" + result);
         }
-        locationsStr =
-            PrintScanRangeLocations(execRequest.query_exec_request).toString();
+        // Query exec request may not be set for DDL, e.g., CTAS.
+        if (execRequest.isSetQuery_exec_request()) {
+          locationsStr =
+              PrintScanRangeLocations(execRequest.query_exec_request).toString();
+        }
       }
     } catch (ImpalaException e) {
       if (e instanceof AnalysisException) {
@@ -268,9 +266,7 @@ public class PlannerTest {
    try {
      // distributed plan
      execRequest = frontend_.createExecRequest(queryCtxt, explainBuilder);
-     Preconditions.checkState(execRequest.stmt_type == TStmtType.DML
-         || execRequest.stmt_type == TStmtType.QUERY);
-     String explainStr = removeResourceEstimates(explainBuilder.toString());
+     String explainStr = removeExplainHeader(explainBuilder.toString());
      actualOutput.append(explainStr);
      if (!isImplemented) {
        errorLog.append(
@@ -306,13 +302,18 @@ public class PlannerTest {
   }
 
   /**
-   * Strips out the header containing resource estimates from the given explain plan,
-   * because the estimates can change easily with stats/cardinality.
+   * Strips out the header containing resource estimates and the warning about missing
+   * stats from the given explain plan, because the estimates can change easily with
+   * stats/cardinality.
    */
-  private String removeResourceEstimates(String explain) {
-    if (explain.startsWith("Estimated Per-Host Requirements:")) {
-      String[] lines = explain.split("\n");
-      return Joiner.on("\n").join(Arrays.copyOfRange(lines, 2, lines.length)) + "\n";
+  private String removeExplainHeader(String explain) {
+    String[] lines = explain.split("\n");
+    // Find the first empty line - the end of the header.
+    for (int i = 0; i < lines.length - 1; ++i) {
+      if (lines[i].isEmpty()) {
+        return Joiner.on("\n").join(Arrays.copyOfRange(lines, i + 1 , lines.length))
+            + "\n";
+      }
     }
     return explain;
   }
@@ -451,6 +452,11 @@ public class PlannerTest {
   @Test
   public void testDistinctEstimate() {
     runPlannerTestFile("distinct-estimate");
+  }
+
+  @Test
+  public void testDdl() {
+    runPlannerTestFile("ddl");
   }
 
   @Test

@@ -25,7 +25,7 @@ set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/util")
 
 add_library(Util
   benchmark.cc
-  cgroups-util.cc
+  cgroups-mgr.cc
   codec.cc
   compress.cc
   cpu-info.cc
@@ -35,6 +35,7 @@ add_library(Util
   default-path-handlers.cc
   disk-info.cc
   error-util.cc
+  fe-test-info.cc
   hdfs-util.cc
   hdfs-bulk-ops.cc
   impalad-metrics.cc
@@ -50,7 +51,7 @@ add_library(Util
   pprof-path-handlers.cc
 # TODO: not supported on RHEL 5
 #  perf-counters.cc
-  proc-util.cc
+  os-util.cc
   thread.cc
   time.cc
   progress-updater.cc
@@ -61,12 +62,17 @@ add_library(Util
   memory-metrics.cc
   url-parser.cc
   url-coding.cc
+  llama-util.cc
 )
 
 add_library(Webserver STATIC
   ${SQUEASEL_SRC_DIR}/squeasel.c
   webserver.cc
 )
+
+# Squeasel requires C99 compatibility to build.
+SET_SOURCE_FILES_PROPERTIES(${SQUEASEL_SRC_DIR}/squeasel.c
+  PROPERTIES COMPILE_FLAGS -std=c99)
 
 # shared library which provides native logging support to JVMs over JNI.
 add_library(loggingsupport SHARED

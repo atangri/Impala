@@ -14,43 +14,52 @@
 
 package com.cloudera.impala.catalog;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.apache.log4j.Logger;
-
+import com.cloudera.impala.analysis.ArithmeticExpr;
+import com.cloudera.impala.analysis.BinaryPredicate;
+import com.cloudera.impala.analysis.CaseExpr;
+import com.cloudera.impala.analysis.CastExpr;
+import com.cloudera.impala.analysis.CompoundPredicate;
 import com.cloudera.impala.analysis.FunctionName;
+import com.cloudera.impala.analysis.LikePredicate;
+import com.cloudera.impala.builtins.ScalarBuiltins;
 import com.cloudera.impala.catalog.MetaStoreClientPool.MetaStoreClient;
-import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.thrift.TCatalogObject;
-import com.cloudera.impala.thrift.TCatalogObjectType;
+import com.cloudera.impala.thrift.TFunction;
 import com.cloudera.impala.thrift.TFunctionType;
 import com.cloudera.impala.thrift.TPartitionKeyValue;
 import com.cloudera.impala.thrift.TTableName;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.cache.CacheLoader;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 
 /**
  * Thread safe interface for reading and updating metadata stored in the Hive MetaStore.
- * This class caches db-, table- and column-related metadata. Each time one of these
- * catalog objects is updated/added/removed, the catalogVersion_ is incremented.
- * Although this class is thread safe, it does not guarantee consistency with the
- * MetaStore. It is important to keep in mind that there may be external (potentially
- * conflicting) concurrent metastore updates occurring at any time.
- * All reads and writes of catalog objects are synchronized using the catalogLock_. To
- * perform atomic bulk operations on the Catalog, the getReadLock()/getWriteLock()
- * functions can be leveraged.
+ * This class provides a storage API for caching CatalogObjects: databases, tables,
+ * and functions and the relevant metadata to go along with them. Although this class is
+ * thread safe, it does not guarantee consistency with the MetaStore. It is important
+ * to keep in mind that there may be external (potentially conflicting) concurrent
+ * metastore updates occurring at any time.
+ * The CatalogObject storage hierarchy is:
+ * Catalog -> Db -> Table
+ *               -> Function
+ * Each level has its own synchronization, so the cache of Dbs is synchronized and each
+ * Db has a cache of tables which is synchronized independently.
+ *
+ * The catalog is populated with the impala builtins on startup. Builtins and user
+ * functions are treated identically by the catalog. The builtins go in a specific
+ * database that the user cannot modify.
+ * Builtins are populated on startup in initBuiltins().
  */
 public abstract class Catalog {
   // Initial catalog version.
@@ -58,81 +67,40 @@ public abstract class Catalog {
   public static final String DEFAULT_DB = "default";
   private static final int META_STORE_CLIENT_POOL_SIZE = 5;
 
-  private static final Logger LOG = Logger.getLogger(Catalog.class);
+  public static final String BUILTINS_DB = "_impala_builtins";
 
-  // Last assigned catalog version. Starts at INITIAL_CATALOG_VERSION and incremented
-  // with each update to the Catalog. Persisted across the lifetime of the Catalog.
-  // Atomic to ensure versions are always sequentially increasing, even when updated
-  // from different threads.
-  // TODO: This probably doesn't need to be atomic and can be updated while holding
-  // the catalogLock_.
-  private final static AtomicLong catalogVersion_ =
-      new AtomicLong(INITIAL_CATALOG_VERSION);
-  private final MetaStoreClientPool metaStoreClientPool_ = new MetaStoreClientPool(0);
-  private final CatalogInitStrategy initStrategy_;
-  private final AtomicInteger nextTableId_ = new AtomicInteger(0);
+  protected final MetaStoreClientPool metaStoreClientPool_ = new MetaStoreClientPool(0);
 
-  // Cache of database metadata.
-  protected final CatalogObjectCache<Db> dbCache_ = new CatalogObjectCache<Db>(
-      new CacheLoader<String, Db>() {
-        @Override
-        public Db load(String dbName) {
-          MetaStoreClient msClient = getMetaStoreClient();
-          try {
-            return Db.loadDb(Catalog.this, msClient.getHiveClient(),
-                dbName.toLowerCase(), true);
-          } finally {
-            msClient.release();
-          }
-        }
-      });
+  // Thread safe cache of database metadata. Uses an AtomicReference so reset()
+  // operations can atomically swap dbCache_ references.
+  // TODO: Update this to use a CatalogObjectCache?
+  protected AtomicReference<ConcurrentHashMap<String, Db>> dbCache_ =
+      new AtomicReference<ConcurrentHashMap<String, Db>>(
+          new ConcurrentHashMap<String, Db>());
 
-  // Fair lock used to synchronize catalog accesses and updates.
-  protected final ReentrantReadWriteLock catalogLock_ =
-      new ReentrantReadWriteLock(true);
-
-  // Determines how the Catalog should be initialized.
-  public enum CatalogInitStrategy {
-    // Load only db and table names on startup.
-    LAZY,
-    // Load all metadata on startup
-    IMMEDIATE,
-    // Don't load anything on startup (creates an empty catalog).
-    EMPTY,
-  }
+  // Cache of the DB containing the builtins.
+  private static Db builtinsDb_;
 
   /**
-   * Creates a new instance of the Catalog, initializing it based on
-   * the given CatalogInitStrategy.
+   * Creates a new instance of a Catalog. If initMetastoreClientPool is true, will
+   * also add META_STORE_CLIENT_POOL_SIZE clients to metastoreClientPool_.
    */
-  public Catalog(CatalogInitStrategy initStrategy) {
-    initStrategy_ = initStrategy;
-    // Don't create any metastore clients for empty catalogs.
-    if (initStrategy != CatalogInitStrategy.EMPTY) {
+  public Catalog(boolean initMetastoreClientPool) {
+    if (initMetastoreClientPool) {
       metaStoreClientPool_.addClients(META_STORE_CLIENT_POOL_SIZE);
     }
-    reset();
+    initBuiltins();
   }
 
-  public Catalog() { this(CatalogInitStrategy.LAZY); }
+  public Db getBuiltinsDb() { return builtinsDb_;}
 
   /**
-   * Adds a database name to the metadata cache and returns the database's
-   * Thrift representation. Used by CREATE DATABASE statements.
+   * Adds a new database to the catalog, replacing any existing database with the same
+   * name. Returns the previous database with this name, or null if there was no
+   * previous database.
    */
-  public TCatalogObject addDb(String dbName) throws ImpalaException {
-    TCatalogObject db = new TCatalogObject(TCatalogObjectType.DATABASE,
-        Catalog.INITIAL_CATALOG_VERSION);
-    catalogLock_.writeLock().lock();
-    try {
-      dbCache_.add(dbName);
-      Db newDb = dbCache_.get(dbName);
-      db.setDb(newDb.toThrift());
-      db.setCatalog_version(newDb.getCatalogVersion());
-      return db;
-    } finally {
-      catalogLock_.writeLock().unlock();
-    }
+  public Db addDb(Db db) {
+    return dbCache_.get().put(db.getName().toLowerCase(), db);
   }
 
   /**
@@ -142,18 +110,16 @@ public abstract class Catalog {
   public Db getDb(String dbName) {
     Preconditions.checkState(dbName != null && !dbName.isEmpty(),
         "Null or empty database name given as argument to Catalog.getDb");
-    try {
-      return dbCache_.get(dbName);
-    } catch (ImpalaException e) {
-      throw new IllegalStateException(e);
-    }
+    return dbCache_.get().get(dbName.toLowerCase());
   }
 
   /**
-   * Returns the Db with the given name if present in the db cache, null otherwise.
+   * Removes a database from the metadata cache. Returns the value removed or null
+   * if not database was removed as part of this operation. Used by DROP DATABASE
+   * statements.
    */
-  public Db getDbIfPresent(String dbName) {
-    return dbCache_.getIfPresent(dbName);
+  public Db removeDb(String dbName) {
+    return dbCache_.get().remove(dbName.toLowerCase());
   }
 
   /**
@@ -163,51 +129,7 @@ public abstract class Catalog {
    * dbPattern may be null (and thus matches everything).
    */
   public List<String> getDbNames(String dbPattern) {
-    catalogLock_.readLock().lock();
-    try {
-      return filterStringsByPattern(dbCache_.getAllNames(), dbPattern);
-    } finally {
-      catalogLock_.readLock().unlock();
-    }
-  }
-
-  /**
-   * Removes a database from the metadata cache. Used by DROP DATABASE statements.
-   */
-  public long removeDb(String dbName) {
-    catalogLock_.writeLock().lock();
-    try {
-      return dbCache_.remove(dbName);
-    } finally {
-      catalogLock_.writeLock().unlock();
-    }
-  }
-
-  /**
-   * Adds a new table to the catalog and returns the the table's Thrift representation.
-   * If the operations succeeds, returns a TCatalogObject that include this change. If
-   * the database does not exist a CatalogObject with a version of
-   * INITIAL_CATALOG_VERSION will be returned.
-   */
-  public TCatalogObject addTable(String dbName, String tblName)
-      throws TableLoadingException {
-    TCatalogObject tbl = new TCatalogObject(TCatalogObjectType.TABLE,
-        Catalog.INITIAL_CATALOG_VERSION);
-    catalogLock_.writeLock().lock();
-    try {
-      Db db = getDb(dbName);
-      if (db != null) {
-        db.addTable(tblName);
-        Table newTbl = db.getTable(tblName);
-        Preconditions.checkNotNull(newTbl);
-        tbl.setType(newTbl.getCatalogObjectType());
-        tbl.setCatalog_version(newTbl.getCatalogVersion());
-        tbl.setTable(newTbl.toThrift());
-      }
-    } finally {
-      catalogLock_.writeLock().unlock();
-    }
-    return tbl;
+    return filterStringsByPattern(dbCache_.get().keySet(), dbPattern);
   }
 
   /**
@@ -215,22 +137,23 @@ public abstract class Catalog {
    * metadata load if the table metadata is not yet cached.
    */
   public Table getTable(String dbName, String tableName) throws
-      DatabaseNotFoundException, TableNotFoundException, TableLoadingException {
-    catalogLock_.readLock().lock();
-    try {
-      Db db = getDb(dbName);
-      if (db == null) {
-        throw new DatabaseNotFoundException("Database not found: " + dbName);
-      }
-      Table table = db.getTable(tableName);
-      if (table == null) {
-        throw new TableNotFoundException(
-            String.format("Table not found: %s.%s", dbName, tableName));
-      }
-      return table;
-    } finally {
-      catalogLock_.readLock().unlock();
+      DatabaseNotFoundException {
+    Db db = getDb(dbName);
+    if (db == null) {
+      throw new DatabaseNotFoundException("Database '" + dbName + "' not found");
     }
+    return db.getTable(tableName);
+  }
+
+  /**
+   * Removes a table from the catalog and returns the table that was removed, or null
+   * if the table/database does not exist.
+   */
+  public Table removeTable(TTableName tableName) {
+    // Remove the old table name from the cache and add the new table.
+    Db db = getDb(tableName.getDb_name());
+    if (db == null) return null;
+    return db.removeTable(tableName.getTable_name());
   }
 
   /**
@@ -245,107 +168,16 @@ public abstract class Catalog {
   public List<String> getTableNames(String dbName, String tablePattern)
       throws DatabaseNotFoundException {
     Preconditions.checkNotNull(dbName);
-    catalogLock_.readLock().lock();
-    try {
-      Db db = getDb(dbName);
-      if (db == null) {
-        throw new DatabaseNotFoundException("Database '" + dbName + "' not found");
-      }
-      return filterStringsByPattern(db.getAllTableNames(), tablePattern);
-    } finally {
-      catalogLock_.readLock().unlock();
+    Db db = getDb(dbName);
+    if (db == null) {
+      throw new DatabaseNotFoundException("Database '" + dbName + "' not found");
     }
+    return filterStringsByPattern(db.getAllTableNames(), tablePattern);
   }
 
   public boolean containsTable(String dbName, String tableName) {
-    catalogLock_.readLock().lock();
-    try {
-      Db db = getDb(dbName);
-      return (db == null) ? false : db.containsTable(tableName);
-    } finally {
-      catalogLock_.readLock().unlock();
-    }
-  }
-
-  /**
-   * Renames a table and returns the thrift representation of the new table.
-   * This is equivalent to an atomic drop + add of the table. Returns
-   * a catalog object with a version of INITIAL_CATALOG_VERSION if the target
-   * parent database does not exist in the catalog.
-   */
-  public TCatalogObject renameTable(TTableName oldTableName, TTableName newTableName)
-      throws TableLoadingException {
-    // Ensure the removal of the old table and addition of the new table happen
-    // atomically.
-    catalogLock_.writeLock().lock();
-    try {
-      // Remove the old table name from the cache and add the new table.
-      Db db = getDb(oldTableName.getDb_name());
-      if (db != null) db.removeTable(oldTableName.getTable_name());
-      return addTable(newTableName.getDb_name(), newTableName.getTable_name());
-    } finally {
-      catalogLock_.writeLock().unlock();
-    }
-  }
-
-  /**
-   * Removes a table from the catalog and returns the catalog version that
-   * contains the change. Returns INITIAL_CATALOG_VERSION if the parent
-   * database or table does not exist in the catalog.
-   */
-  public long removeTable(TTableName tableName) {
-    catalogLock_.writeLock().lock();
-    try {
-      // Remove the old table name from the cache and add the new table.
-      Db db = getDb(tableName.getDb_name());
-      if (db == null) return Catalog.INITIAL_CATALOG_VERSION;
-      return db.removeTable(tableName.getTable_name());
-    } finally {
-      catalogLock_.writeLock().unlock();
-    }
-  }
-
-  /**
-   * If isRefresh is false, invalidates a specific table's metadata, forcing the
-   * metadata to be reloaded on the next access.
-   * If isRefresh is true, performs an immediate incremental refresh.
-   * Returns the catalog version that will contain the updated metadata.
-   */
-  public TCatalogObject resetTable(TTableName tableName, boolean isRefresh)
-      throws TableLoadingException {
-    Db db;
-    catalogLock_.writeLock().lock();
-    try {
-      db = getDb(tableName.getDb_name());
-      if (db == null) return null;
-      if (isRefresh) {
-        // TODO: This is not good because refreshes might take a long time we
-        // shouldn't hold the catalog write lock the entire time. Instead,
-        // we could consider making refresh() happen in the background or something
-        // similar.
-        LOG.debug("Refreshing table metadata: " + db.getName() + "." + tableName);
-        db.refreshTable(tableName.getTable_name());
-      } else {
-        LOG.debug("Invalidating table metadata: " + db.getName() + "." + tableName);
-        db.invalidateTable(tableName.getTable_name());
-      }
-      // Downgrade to a read lock.
-      catalogLock_.readLock().lock();
-    } finally {
-      catalogLock_.writeLock().unlock();
-    }
-
-    // Read lock should be acquired when we get here.
-    try {
-      Table table = db.getTable(tableName.getTable_name());
-      TCatalogObject catalogObject = new TCatalogObject();
-      catalogObject.setType(table.getCatalogObjectType());
-      catalogObject.setCatalog_version(table.getCatalogVersion());
-      catalogObject.setTable(table.toThrift());
-      return catalogObject;
-    } finally {
-      catalogLock_.readLock().unlock();
-    }
+    Db db = getDb(dbName);
+    return (db == null) ? false : db.containsTable(tableName);
   }
 
   /**
@@ -358,14 +190,9 @@ public abstract class Catalog {
    * resolve first to db.fn().
    */
   public boolean addFunction(Function fn) {
-    catalogLock_.writeLock().lock();
-    try {
-      Db db = getDb(fn.dbName());
-      if (db == null) return false;
-      return db.addFunction(fn);
-    } finally {
-      catalogLock_.writeLock().unlock();
-    }
+    Db db = getDb(fn.dbName());
+    if (db == null) return false;
+    return db.addFunction(fn);
   }
 
   /**
@@ -374,14 +201,13 @@ public abstract class Catalog {
    * in the catalog, it will return the function with the strictest matching mode.
    */
   public Function getFunction(Function desc, Function.CompareMode mode) {
-    catalogLock_.readLock().lock();
-    try {
-      Db db = getDb(desc.dbName());
-      if (db == null) return null;
-      return db.getFunction(desc, mode);
-    } finally {
-      catalogLock_.readLock().unlock();
-    }
+    Db db = getDb(desc.dbName());
+    if (db == null) return null;
+    return db.getFunction(desc, mode);
+  }
+
+  public static Function getBuiltin(Function desc, Function.CompareMode mode) {
+    return builtinsDb_.getFunction(desc, mode);
   }
 
   /**
@@ -390,16 +216,9 @@ public abstract class Catalog {
    * null.
    */
   public Function removeFunction(Function desc) {
-    catalogLock_.writeLock().lock();
-    try {
-      Db db = getDb(desc.dbName());
-      if (db == null) return null;
-      Function fn = db.removeFunction(desc);
-      if (fn != null) fn.setCatalogVersion(Catalog.incrementAndGetCatalogVersion());
-      return fn;
-    } finally {
-      catalogLock_.writeLock().unlock();
-    }
+    Db db = getDb(desc.dbName());
+    if (db == null) return null;
+    return db.removeFunction(desc);
   }
 
   /**
@@ -407,31 +226,21 @@ public abstract class Catalog {
    */
   public List<String> getFunctionSignatures(TFunctionType type, String dbName,
       String pattern) throws DatabaseNotFoundException {
-    catalogLock_.readLock().lock();
-    try {
-      Db db = getDb(dbName);
-      if (db == null) {
-        throw new DatabaseNotFoundException("Database '" + dbName + "' not found");
-      }
-      return filterStringsByPattern(db.getAllFunctionSignatures(type), pattern);
-    } finally {
-      catalogLock_.readLock().unlock();
+    Db db = getDb(dbName);
+    if (db == null) {
+      throw new DatabaseNotFoundException("Database '" + dbName + "' not found");
     }
+    return filterStringsByPattern(db.getAllFunctionSignatures(type), pattern);
   }
 
   /**
    * Returns true if there is a function with this function name. Parameters
    * are ignored.
    */
-  public boolean functionExists(FunctionName name) {
-    catalogLock_.readLock().lock();
-    try {
-      Db db = getDb(name.getDb());
-      if (db == null) return false;
-      return db.functionExists(name);
-    } finally {
-      catalogLock_.readLock().unlock();
-    }
+  public boolean containsFunction(FunctionName name) {
+    Db db = getDb(name.getDb());
+    if (db == null) return false;
+    return db.containsFunction(name.getFunction());
   }
 
   /**
@@ -440,95 +249,11 @@ public abstract class Catalog {
    */
   public void close() { metaStoreClientPool_.close(); }
 
-  /**
-   * Gets the next table ID and increments the table ID counter.
-   */
-  public TableId getNextTableId() { return new TableId(nextTableId_.getAndIncrement()); }
 
   /**
    * Returns a managed meta store client from the client connection pool.
    */
   public MetaStoreClient getMetaStoreClient() { return metaStoreClientPool_.getClient(); }
-
-  /**
-   * Returns the current Catalog version.
-   */
-  public static long getCatalogVersion() { return catalogVersion_.get(); }
-
-  /**
-   * Increments the current Catalog version and returns the new value.
-   */
-  public static long incrementAndGetCatalogVersion() {
-    return catalogVersion_.incrementAndGet();
-  }
-
-  /**
-   * Resets this catalog instance by clearing all cached metadata and reloading
-   * it from the metastore. How the metadata is loaded is based on the
-   * CatalogInitStrategy that was set in the c'tor. If the CatalogInitStrategy is
-   * IMMEDIATE, the table metadata will be loaded in parallel.
-   */
-  public long reset() {
-    catalogLock_.writeLock().lock();
-    try {
-      return resetInternal();
-    } finally {
-      catalogLock_.writeLock().unlock();
-    }
-  }
-
-  /**
-   * Executes the underlying reset logic. catalogLock_.writeLock() must
-   * be taken before calling this.
-   */
-  protected long resetInternal() {
-    try {
-      nextTableId_.set(0);
-      dbCache_.clear();
-
-      if (initStrategy_ == CatalogInitStrategy.EMPTY) {
-        return Catalog.getCatalogVersion();
-      }
-      MetaStoreClient msClient = metaStoreClientPool_.getClient();
-
-      try {
-        dbCache_.add(msClient.getHiveClient().getAllDatabases());
-      } finally {
-        msClient.release();
-      }
-
-      if (initStrategy_ == CatalogInitStrategy.IMMEDIATE) {
-        // The number of parallel threads to use to load table metadata. This number
-        // was chosen based on experimentation of what provided good throughput while not
-        // putting too much stress on the metastore.
-        ExecutorService executor = Executors.newFixedThreadPool(16);
-        try {
-          for (String dbName: dbCache_.getAllNames()) {
-            final Db db = dbCache_.get(dbName);
-            for (final String tableName: db.getAllTableNames()) {
-              executor.execute(new Runnable() {
-                @Override
-                public void run() {
-                  try {
-                    db.getTable(tableName);
-                  } catch (ImpalaException e) {
-                    LOG.warn("Error: " + e.getMessage());
-                  }
-                }
-              });
-            }
-          }
-        } finally {
-          executor.shutdown();
-        }
-      }
-      return Catalog.getCatalogVersion();
-    } catch (Exception e) {
-      LOG.error(e);
-      LOG.error("Error initializing Catalog. Catalog may be empty.");
-      throw new IllegalStateException(e);
-    }
-  }
 
   /**
    * Implement Hive's pattern-matching semantics for SHOW statements. The only
@@ -583,21 +308,16 @@ public abstract class Catalog {
       PartitionNotFoundException, TableNotFoundException, TableLoadingException {
     String partitionNotFoundMsg =
         "Partition not found: " + Joiner.on(", ").join(partitionSpec);
-    catalogLock_.readLock().lock();
-    try {
-      Table table = getTable(dbName, tableName);
-      // This is not an Hdfs table, throw an error.
-      if (!(table instanceof HdfsTable)) {
-        throw new PartitionNotFoundException(partitionNotFoundMsg);
-      }
-      // Get the HdfsPartition object for the given partition spec.
-      HdfsPartition partition =
-          ((HdfsTable) table).getPartitionFromThriftPartitionSpec(partitionSpec);
-      if (partition == null) throw new PartitionNotFoundException(partitionNotFoundMsg);
-      return partition;
-    } finally {
-      catalogLock_.readLock().unlock();
+    Table table = getTable(dbName, tableName);
+    // This is not an Hdfs table, throw an error.
+    if (!(table instanceof HdfsTable)) {
+      throw new PartitionNotFoundException(partitionNotFoundMsg);
     }
+    // Get the HdfsPartition object for the given partition spec.
+    HdfsPartition partition =
+        ((HdfsTable) table).getPartitionFromThriftPartitionSpec(partitionSpec);
+    if (partition == null) throw new PartitionNotFoundException(partitionNotFoundMsg);
+    return partition;
   }
 
   /**
@@ -652,17 +372,15 @@ public abstract class Catalog {
         break;
       }
       case FUNCTION: {
-        for (String dbName: getDbNames(null)) {
-          Db db = getDb(dbName);
-          if (db == null) continue;
-          Function fn = db.getFunction(objectDesc.getFn().getSignature());
-          if (fn == null) continue;
-          result.setType(fn.getCatalogObjectType());
-          result.setCatalog_version(fn.getCatalogVersion());
-          result.setFn(fn.toThrift());
-          break;
+        TFunction tfn = objectDesc.getFn();
+        Function desc = Function.fromThrift(tfn);
+        Function fn = getFunction(desc, Function.CompareMode.IS_INDISTINGUISHABLE);
+        if (fn == null) {
+          throw new CatalogException("Function not found: " + tfn);
         }
-        if (!result.isSetFn()) throw new CatalogException("Function not found.");
+        result.setType(fn.getCatalogObjectType());
+        result.setCatalog_version(fn.getCatalogVersion());
+        result.setFn(fn.toThrift());
         break;
       }
       default: throw new IllegalStateException(
@@ -672,40 +390,281 @@ public abstract class Catalog {
   }
 
   /**
-   * Returns the table parameter 'transient_lastDdlTime', or -1 if it's not set.
-   * TODO: move this to a metastore helper class.
+   * Initializes all the builtins.
    */
-  public static long getLastDdlTime(org.apache.hadoop.hive.metastore.api.Table msTbl) {
-    Preconditions.checkNotNull(msTbl);
-    Map<String, String> params = msTbl.getParameters();
-    String lastDdlTimeStr = params.get("transient_lastDdlTime");
-    if (lastDdlTimeStr != null) {
-      try {
-        return Long.parseLong(lastDdlTimeStr);
-      } catch (NumberFormatException e) {}
+  private void initBuiltins() {
+    if (builtinsDb_ != null) {
+      // Only in the FE test setup do we hit this case.
+      addDb(builtinsDb_);
+      return;
     }
-    return -1;
+    Preconditions.checkState(getDb(BUILTINS_DB) == null);
+    Preconditions.checkState(builtinsDb_ == null);
+    builtinsDb_ = new Db(BUILTINS_DB, this);
+    builtinsDb_.setIsSystemDb(true);
+    addDb(builtinsDb_);
+
+    // Populate all aggregate builtins.
+    initAggregateBuiltins();
+
+    // Populate all scalar builtins.
+    ArithmeticExpr.initBuiltins(builtinsDb_);
+    BinaryPredicate.initBuiltins(builtinsDb_);
+    CastExpr.initBuiltins(builtinsDb_);
+    CaseExpr.initBuiltins(builtinsDb_);
+    CompoundPredicate.initBuiltins(builtinsDb_);
+    LikePredicate.initBuiltins(builtinsDb_);
+    ScalarBuiltins.initBuiltins(builtinsDb_);
   }
 
-  /**
-   * Updates the cached lastDdlTime for the given table. The lastDdlTime is used during
-   * the metadata refresh() operations to determine if there have been any external
-   * (outside of Impala) modifications to the table.
-   */
-  public void updateLastDdlTime(TTableName tblName, long ddlTime) {
-    catalogLock_.writeLock().lock();
-    try {
-      Db db = getDb(tblName.getDb_name());
-      if (db == null) return;
-      try {
-        Table tbl = db.getTable(tblName.getTable_name());
-        if (tbl == null) return;
-        tbl.updateLastDdlTime(ddlTime);
-      } catch (Exception e) {
-        // Swallow all exceptions.
-      }
-    } finally {
-      catalogLock_.writeLock().unlock();
+  private static final Map<ColumnType, String> HLL_UPDATE_SYMBOL =
+      ImmutableMap.<ColumnType, String>builder()
+        .put(ColumnType.BOOLEAN,
+            "9HllUpdateIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.TINYINT,
+            "9HllUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.SMALLINT,
+            "9HllUpdateIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.INT,
+            "9HllUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.BIGINT,
+            "9HllUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.FLOAT,
+            "9HllUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.DOUBLE,
+            "9HllUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.STRING,
+            "9HllUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
+        .put(ColumnType.TIMESTAMP,
+            "9HllUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.DECIMAL, "")
+        .build();
+
+  private static final Map<ColumnType, String> PC_UPDATE_SYMBOL =
+      ImmutableMap.<ColumnType, String>builder()
+        .put(ColumnType.BOOLEAN,
+            "8PcUpdateIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.TINYINT,
+            "8PcUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.SMALLINT,
+            "8PcUpdateIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.INT,
+            "8PcUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.BIGINT,
+            "8PcUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.FLOAT,
+            "8PcUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.DOUBLE,
+            "8PcUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.STRING,
+            "8PcUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
+        .put(ColumnType.TIMESTAMP,
+            "8PcUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+         .put(ColumnType.DECIMAL, "")
+        .build();
+
+    private static final Map<ColumnType, String> PCSA_UPDATE_SYMBOL =
+      ImmutableMap.<ColumnType, String>builder()
+          .put(ColumnType.BOOLEAN,
+              "10PcsaUpdateIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+          .put(ColumnType.TINYINT,
+              "10PcsaUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+          .put(ColumnType.SMALLINT,
+              "10PcsaUpdateIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+          .put(ColumnType.INT,
+              "10PcsaUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+          .put(ColumnType.BIGINT,
+              "10PcsaUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+          .put(ColumnType.FLOAT,
+              "10PcsaUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+          .put(ColumnType.DOUBLE,
+              "10PcsaUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+          .put(ColumnType.STRING,
+              "10PcsaUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
+          .put(ColumnType.TIMESTAMP,
+              "10PcsaUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+          .put(ColumnType.DECIMAL, "")
+          .build();
+
+  private static final Map<ColumnType, String> MIN_UPDATE_SYMBOL =
+      ImmutableMap.<ColumnType, String>builder()
+        .put(ColumnType.BOOLEAN,
+            "3MinIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.TINYINT,
+            "3MinIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.SMALLINT,
+            "3MinIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.INT,
+            "3MinIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.BIGINT,
+            "3MinIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.FLOAT,
+            "3MinIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.DOUBLE,
+            "3MinIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.STRING,
+            "3MinIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.TIMESTAMP,
+            "3MinIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.DECIMAL, "")
+        .build();
+
+  private static final Map<ColumnType, String> MAX_UPDATE_SYMBOL =
+      ImmutableMap.<ColumnType, String>builder()
+        .put(ColumnType.BOOLEAN,
+            "3MaxIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.TINYINT,
+            "3MaxIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.SMALLINT,
+            "3MaxIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.INT,
+            "3MaxIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.BIGINT,
+            "3MaxIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.FLOAT,
+            "3MaxIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.DOUBLE,
+            "3MaxIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.STRING,
+            "3MaxIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.TIMESTAMP,
+            "3MaxIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(ColumnType.DECIMAL, "")
+        .build();
+
+  // Populate all the aggregate builtins in the catalog.
+  // null symbols indicate the function does not need that step of the evaluation.
+  // An empty symbol indicates a TODO for the BE to implement the function.
+  // TODO: We could also generate this in python but I'm not sure that is easier.
+  private void initAggregateBuiltins() {
+    final String prefix = "_ZN6impala18AggregateFunctions";
+    final String initNullString = prefix +
+        "14InitNullStringEPN10impala_udf15FunctionContextEPNS1_9StringValE";
+    final String initNull = prefix +
+        "8InitNullEPN10impala_udf15FunctionContextEPNS1_6AnyValE";
+    final String stringValSerializeOrFinalize = prefix +
+        "28StringValSerializeOrFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE";
+
+    Db db = builtinsDb_;
+    // Count (*)
+    // TODO: the merge function should be Sum but the way we rewrite distincts
+    // makes that not work.
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "count",
+        new ArrayList<ColumnType>(),
+        ColumnType.BIGINT, ColumnType.BIGINT,
+        prefix + "8InitZeroIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextEPT_",
+        prefix + "15CountStarUpdateEPN10impala_udf15FunctionContextEPNS1_9BigIntValE",
+        prefix + "15CountStarUpdateEPN10impala_udf15FunctionContextEPNS1_9BigIntValE",
+        null, null, false));
+
+    for (ColumnType t : ColumnType.getSupportedTypes()) {
+      if (t.isNull()) continue; // NULL is handled through type promotion.
+      // Count
+      db.addBuiltin(AggregateFunction.createBuiltin(db, "count",
+          Lists.newArrayList(t), ColumnType.BIGINT, ColumnType.BIGINT,
+          prefix + "8InitZeroIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextEPT_",
+          prefix + "11CountUpdateEPN10impala_udf15FunctionContextERKNS1_6AnyValEPNS1_9BigIntValE",
+          prefix + "11CountUpdateEPN10impala_udf15FunctionContextERKNS1_6AnyValEPNS1_9BigIntValE",
+          null, null, false));
+      // Min
+      String minMaxInit = t.isStringType() ? initNullString : initNull;
+      String minMaxSerializeOrFinalize = t.isStringType() ?
+          stringValSerializeOrFinalize : null;
+      db.addBuiltin(AggregateFunction.createBuiltin(db, "min",
+          Lists.newArrayList(t), t, t, minMaxInit,
+          prefix + MIN_UPDATE_SYMBOL.get(t),
+          prefix + MIN_UPDATE_SYMBOL.get(t),
+          minMaxSerializeOrFinalize, minMaxSerializeOrFinalize, true));
+      // Max
+      db.addBuiltin(AggregateFunction.createBuiltin(db, "max",
+          Lists.newArrayList(t), t, t, minMaxInit,
+          prefix + MAX_UPDATE_SYMBOL.get(t),
+          prefix + MAX_UPDATE_SYMBOL.get(t),
+          minMaxSerializeOrFinalize, minMaxSerializeOrFinalize, true));
+      // NDV
+      // TODO: this needs to switch to CHAR(64) as the intermediate type
+      db.addBuiltin(AggregateFunction.createBuiltin(db, "ndv",
+          Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
+          prefix + "7HllInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+          prefix + HLL_UPDATE_SYMBOL.get(t),
+          prefix + "8HllMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+          stringValSerializeOrFinalize,
+          prefix + "11HllFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+          true));
+
+      // distinctpc
+      // TODO: this needs to switch to CHAR(64) as the intermediate type
+      db.addBuiltin(AggregateFunction.createBuiltin(db, "distinctpc",
+          Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
+          prefix + "6PcInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+          prefix + PC_UPDATE_SYMBOL.get(t),
+          prefix + "7PcMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+          stringValSerializeOrFinalize,
+          prefix + "10PcFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+          true));
+
+      // distinctpcsa
+      // TODO: this needs to switch to CHAR(64) as the intermediate type
+      db.addBuiltin(AggregateFunction.createBuiltin(db, "distinctpcsa",
+          Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
+          prefix + "6PcInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
+          prefix + PCSA_UPDATE_SYMBOL.get(t),
+          prefix + "7PcMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+          stringValSerializeOrFinalize,
+          prefix + "12PcsaFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+          true));
     }
+
+    // Sum
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "sum",
+        Lists.newArrayList(ColumnType.BIGINT), ColumnType.BIGINT, ColumnType.BIGINT,
+        initNull,
+        prefix + "3SumIN10impala_udf9BigIntValES3_EEvPNS2_15FunctionContextERKT_PT0_",
+        prefix + "3SumIN10impala_udf9BigIntValES3_EEvPNS2_15FunctionContextERKT_PT0_",
+        null, null, false));
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "sum",
+        Lists.newArrayList(ColumnType.DOUBLE), ColumnType.DOUBLE, ColumnType.DOUBLE,
+        initNull,
+        prefix + "3SumIN10impala_udf9DoubleValES3_EEvPNS2_15FunctionContextERKT_PT0_",
+        prefix + "3SumIN10impala_udf9DoubleValES3_EEvPNS2_15FunctionContextERKT_PT0_",
+        null, null, false));
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "sum",
+        Lists.newArrayList(ColumnType.DECIMAL), ColumnType.DECIMAL, ColumnType.DECIMAL,
+        initNull,
+        prefix + "",
+        prefix + "",
+        null, null, false));
+
+    for (ColumnType t: ColumnType.getNumericTypes()) {
+      // Avg
+      // TODO: because of avg rewrite, BE doesn't implement it yet.
+      db.addBuiltin(AggregateFunction.createBuiltin(db, "avg",
+          Lists.newArrayList(t), ColumnType.DOUBLE, ColumnType.DOUBLE,
+          "", "", "", null, "", false));
+    }
+    // Avg(Timestamp)
+    // TODO: why does this make sense? Avg(timestamp) returns a double.
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "avg",
+        Lists.newArrayList(ColumnType.TIMESTAMP),
+        ColumnType.DOUBLE, ColumnType.DOUBLE,
+        "", "", "", null, "", false));
+
+    // Group_concat(string)
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "group_concat",
+        Lists.newArrayList(ColumnType.STRING),
+        ColumnType.STRING, ColumnType.STRING,
+        initNullString,
+        prefix + "12StringConcatEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        prefix + "12StringConcatEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        stringValSerializeOrFinalize, stringValSerializeOrFinalize, false));
+    // Group_concat(string, string)
+    db.addBuiltin(AggregateFunction.createBuiltin(db, "group_concat",
+        Lists.newArrayList(ColumnType.STRING, ColumnType.STRING),
+        ColumnType.STRING, ColumnType.STRING,
+        initNullString,
+        prefix +
+            "12StringConcatEPN10impala_udf15FunctionContextERKNS1_9StringValES6_PS4_",
+        prefix + "12StringConcatEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
+        stringValSerializeOrFinalize, stringValSerializeOrFinalize, false));
   }
 }

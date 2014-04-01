@@ -37,6 +37,9 @@ set -u
 # Exit on non-zero return value
 set -e
 
+# Always run in debug mode
+set -x
+
 # parse command line options
 for ARG in $*
 do
@@ -56,6 +59,9 @@ do
       FORMAT_METASTORE=1
       ;;
     -skiptests)
+      TESTS_ACTION=0
+      ;;
+    -notests)
       TESTS_ACTION=0
       ;;
     -format)
@@ -97,6 +103,7 @@ do
       echo "[-codecoverage_debug] : Debug code coverage build"
       echo "[-asan] : Build with address sanitizer"
       echo "[-skiptests] : Skips execution of all tests"
+      echo "[-notests] : Skips building and execution of all tests"
       echo "[-testpairwise] : Sun tests in 'pairwise' mode (increases"\
            "test execution time)"
       echo "[-testexhaustive] : Run tests in 'exhaustive' mode (significantly increases"\
@@ -112,6 +119,9 @@ Examples of common tasks:
 
   # Build and skip tests
   ./buildall.sh -skiptests
+
+  # Incrementally rebuild and skip tests
+  ./buildall.sh -skiptests -noclean
 
   # Build, load a snapshot file, run tests
   ./buildall.sh -snapshot_file <file>
@@ -173,9 +183,7 @@ then
 
   # clean llvm
   rm -f $IMPALA_HOME/llvm-ir/impala*.ll
-
-  # Cleanup the version.info file so it will be regenerated for the next build.
-  rm -f $IMPALA_HOME/bin/version.info
+  rm -f $IMPALA_HOME/be/generated-sources/impala-ir/*
 fi
 
 # Kill any processes that may be accessing postgres metastore
@@ -192,19 +200,14 @@ else
   ${IMPALA_HOME}/bin/create-test-configuration.sh
 fi
 
-# build common and backend
-cd $IMPALA_HOME
+
+# Generate all the make files from root.
+cd ${IMPALA_HOME}
 rm -f CMakeCache.txt
-bin/gen_build_version.py
 cmake -DCMAKE_BUILD_TYPE=$TARGET_BUILD_TYPE .
 
-cd $IMPALA_HOME/common/function-registry
-make
-cd $IMPALA_HOME/common/thrift
-make
-cd $IMPALA_BE_DIR
-python src/codegen/gen_ir_descriptions.py
-make -j${IMPALA_BUILD_THREADS:-4}
+# build common and backend
+$IMPALA_HOME/bin/make_impala.sh $*
 
 if [ -e $IMPALA_LZO ]
 then

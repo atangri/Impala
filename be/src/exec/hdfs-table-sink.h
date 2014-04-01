@@ -35,30 +35,34 @@ class RuntimeState;
 class HdfsTableWriter;
 class MemTracker;
 
-// Records the temporary and final Hdfs file name,
-// the opened temporary Hdfs file, and the number of appended rows
-// of an output partition.
+// Records the temporary and final Hdfs file name, the opened temporary Hdfs file, and the
+// number of appended rows of an output partition.
 struct OutputPartition {
-  // Full path to root of the group of files that will be created for this
-  // partition.  Each file will have a sequence number appended.
-  // A table writer may produce multiple files per partition.
-  // Path: <hdfs_base_dir>/<partition_values>/<unique_id_str>
-  std::string hdfs_file_name_template;
+  // In the below, <unique_id_str> is the unique ID passed to HdfsTableSink in string
+  // form. It is typically the fragment ID that owns the sink.
 
-  // File name for current output -- with sequence number appended.
-  // This is a temporary file that will get moved to the permanent file location
+  // Full path to root of the group of files that will be created for this partition.
+  // Each file will have a sequence number appended.  A table writer may produce multiple
+  // files per partition. The root is either partition_descriptor->location (if non-empty,
+  // i.e. the partition has a custom location) or table_dir/partition_name/
+  // Path: <root>/<unique_id_str>
+  std::string final_hdfs_file_name_prefix;
+
+  // File name for current output, with sequence number appended.
+  // This is a temporary file that will get moved to a  permanent location
   // when we commit the insert.
   // Path: <hdfs_base_dir>/<partition_values>/<unique_id_str>.<sequence number>
   std::string current_file_name;
 
-  // Name of the temporary directory.
-  // Path: <hdfs_base_dir>/<unique_id>_dir/
+  // Name of the temporary directory that files for this partition are staged to before
+  // the coordinator moves them to their permanent location once the query completes.
+  // Path: <base_table_dir/<staging_dir>/<unique_id>_dir/
   std::string tmp_hdfs_dir_name;
 
-  // Base name for temporary files: queryId/hdfs_file_name
-  // The file is moved to hdfs_file_name in Close().
-  // Path: tmp_hdfs_dir_name/<partition_values>/<unique_id_str>
-  std::string tmp_hdfs_file_name_template;
+  // Base prefix for temporary files, to save building it every time a temporary file is
+  // created.
+  // Path: tmp_hdfs_dir_name/partition_name/<unique_id_str>
+  std::string tmp_hdfs_file_name_prefix;
 
   // key1=val1/key2=val2/ etc. Used to identify partitions to the metastore.
   std::string partition_name;
@@ -122,13 +126,17 @@ class HdfsTableSink : public DataSink {
 
   // Prepares output_exprs and partition_key_exprs.
   // Also, connects to Hdfs, and prepares the single output partition for static inserts.
-  virtual Status Init(RuntimeState* state);
+  virtual Status Prepare(RuntimeState* state);
+
+  // Opens output_exprs adn partition_key_exprs.
+  virtual Status Open(RuntimeState* state);
 
   // Append all rows in batch to the temporary Hdfs files corresponding to partitions.
   virtual Status Send(RuntimeState* state, RowBatch* batch, bool eos);
 
   // Move temporary Hdfs files to final locations.
   // Remove original Hdfs files if overwrite was specified.
+  // Closes output_exprs and partition_key_exprs.
   virtual void Close(RuntimeState* state);
 
   // Get the block size of the current file opened for this partition.
@@ -138,8 +146,10 @@ class HdfsTableSink : public DataSink {
 
   virtual RuntimeProfile* profile() { return runtime_profile_; }
 
-  RuntimeProfile::Counter* rows_inserted_counter() { return rows_inserted_counter_; }
   MemTracker* mem_tracker() { return mem_tracker_.get(); }
+
+  RuntimeProfile::Counter* rows_inserted_counter() { return rows_inserted_counter_; }
+  RuntimeProfile::Counter* bytes_written_counter() { return bytes_written_counter_; }
   RuntimeProfile::Counter* encode_timer() { return encode_timer_; }
   RuntimeProfile::Counter* hdfs_write_timer() { return hdfs_write_timer_; }
 
@@ -183,7 +193,8 @@ class HdfsTableSink : public DataSink {
   // The Hdfs directory is created from the target table's base Hdfs dir,
   // the partition_key_names_ and the evaluated partition_key_exprs_.
   // The Hdfs file name is the unique_id_str_.
-  void BuildHdfsFileNames(OutputPartition* output);
+  void BuildHdfsFileNames(const HdfsPartitionDescriptor& partition_descriptor,
+      OutputPartition* output);
 
   // Updates runtime stats of HDFS with rows written, then closes the file associated with
   // the partition by calling ClosePartitionFile()
@@ -192,7 +203,7 @@ class HdfsTableSink : public DataSink {
   // Closes the hdfs file for this partition as well as the writer.
   void ClosePartitionFile(RuntimeState* state, OutputPartition* partition);
 
-  // Descriptor of target table. Set in Init().
+  // Descriptor of target table. Set in Prepare().
   const HdfsTableDescriptor* table_desc_;
 
   // Currently this is the default partition since we don't support multi-format sinks.
@@ -228,7 +239,7 @@ class HdfsTableSink : public DataSink {
   bool overwrite_;
 
   // The directory in which to write intermediate results. Set to
-  // <hdfs_table_base_dir>/.impala_insert_staging/ during Init()
+  // <hdfs_table_base_dir>/.impala_insert_staging/ during Prepare()
   std::string staging_dir_;
 
   // string representation of c'tors unique_id. Used for per-partition Hdfs file names,
@@ -254,10 +265,12 @@ class HdfsTableSink : public DataSink {
       PartitionDescriptorMap;
   PartitionDescriptorMap partition_descriptor_map_;
 
+  boost::scoped_ptr<MemTracker> mem_tracker_;
+
   // Allocated from runtime state's pool.
   RuntimeProfile* runtime_profile_;
   RuntimeProfile::Counter* rows_inserted_counter_;
-  boost::scoped_ptr<MemTracker> mem_tracker_;
+  RuntimeProfile::Counter* bytes_written_counter_;
 
   // Time spent converting tuple to on disk format.
   RuntimeProfile::Counter* encode_timer_;

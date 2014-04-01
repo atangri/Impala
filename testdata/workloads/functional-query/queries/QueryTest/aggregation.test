@@ -726,7 +726,7 @@ timestamp, bigint
 # Test NULLs in aggregate functions
 select count(NULL), min(NULL), max(NULL), sum(NULL), avg(NULL) from alltypesagg
 ---- TYPES
-bigint, NULL, NULL, NULL, double
+bigint, boolean, boolean, bigint, double
 ---- RESULTS
 0,NULL,NULL,NULL,NULL
 ====
@@ -734,7 +734,7 @@ bigint, NULL, NULL, NULL, double
 # Test ignored distinct in MIN and MAX with NULLs
 select min(distinct NULL), max(distinct NULL) from alltypesagg
 ---- TYPES
-NULL, NULL
+boolean, boolean
 ---- RESULTS
 NULL,NULL
 ====
@@ -821,7 +821,7 @@ int, string
 ---- QUERY
 # Test group_concat with column delimiter
 # Will cause all columns save first to be duplicated
-select day, group_concat(string_col, string_col)
+select day, group_concat(trim(string_col), trim(string_col))
 from alltypesagg
 where id % 200 = day
 group by day
@@ -866,4 +866,70 @@ select group_concat(string_col) from alltypesagg where string_col = NULL;
 string
 ---- RESULTS
 'NULL'
+====
+---- QUERY
+# Test correct removal of redundant group-by expressions (IMPALA-817)
+select int_col * int_col, int_col + int_col
+from functional.alltypesagg
+group by int_col * int_col, int_col + int_col, int_col * int_col
+having (int_col + int_col) < 5 order by 1 limit 10
+---- TYPES
+bigint,bigint
+---- RESULTS
+1,2
+4,4
+====
+---- QUERY
+# Test that binding predicates on an aggregation properly trigger materialization of
+# slots in the agg tuple and the slots needed for evaluating the corresponding agg funcs
+# (IMPALA-822).
+select 1 from
+  (select count(bigint_col) c from functional.alltypesagg
+   having min(int_col) is not null) as t
+where c is not null
+---- TYPES
+tinyint
+---- RESULTS
+1
+====
+---- QUERY
+# Regression test for subexpr elimination in codegen. IMPALA-765
+select count(tinyint_col), sum(tinyint_col * tinyint_col) from alltypesagg
+---- TYPES
+bigint,bigint
+---- RESULTS
+9000,285000
+====
+---- QUERY
+# Regression test for subexpr elimination in codegen. IMPALA-765
+select count(int_col), sum(int_col), avg(int_col) from alltypesagg where int_col is NULL
+---- TYPES
+bigint,bigint,double
+---- RESULTS
+0,NULL,NULL
+====
+---- QUERY
+# Regression test for subexpr elimination in codegen. IMPALA-850
+select id % 2, int_col > 1, id from alltypesagg where id < 2 group by 1,2,3
+---- TYPES
+int,boolean,int
+---- RESULTS
+0,NULL,0
+1,false,1
+====
+---- QUERY
+# Regression test for min/max of all negative values. IMPALA-869.
+select min(-1.0), max(-1.0) from tinytable
+---- TYPES
+float,float
+---- RESULTS
+-1,-1
+====
+---- QUERY
+# Regression test codegen with nulls and compound predicates. IMPALA-892.
+select COUNT(int_col is not null AND bool_col) - COUNT(bool_col) FROM alltypesagg
+---- TYPES
+BIGINT
+---- RESULTS
+0
 ====

@@ -348,7 +348,6 @@ class ImpalaShell(cmd.Cmd):
   def precmd(self, args):
     self.is_interrupted.clear()
     self.rpc_is_interruptable = False
-    self.query_handle_closed = False
     args = self.sanitise_input(args)
     if not args: return args
     # Split args using sqlparse. If there are multiple queries present in user input,
@@ -606,6 +605,7 @@ class ImpalaShell(cmd.Cmd):
     start_time = time.time()
     rpc_result = self.__do_rpc(lambda: self.imp_service.query(query))
     self.last_query_handle, status = rpc_result.get_results()
+    self.query_handle_closed = False
 
     if self.is_interrupted.isSet():
       if status == RpcStatus.OK:
@@ -621,7 +621,6 @@ class ImpalaShell(cmd.Cmd):
         self.__print_error_log()
         break
       elif query_state == self.query_state["EXCEPTION"]:
-        print_to_stderr('Query aborted.')
         if self.connected:
           self.__print_error_log()
           # Close the query handle even if it's an insert.
@@ -768,8 +767,10 @@ class ImpalaShell(cmd.Cmd):
     rpc_result = self.__do_rpc(
         lambda: self.imp_service.get_log(self.last_query_handle.log_context))
     log, status = rpc_result.get_results()
+    if status != RpcStatus.OK:
+      print_to_stderr("Failed to get error log: %s" % status)
     if log and log.strip():
-      print_to_stderr("\nERRORS ENCOUNTERED DURING EXECUTION: %s" % log)
+      print_to_stderr("ERRORS: %s" % log)
 
   def do_alter(self, args):
     return self.__execute_query(self.__create_beeswax_query("alter %s" % args))

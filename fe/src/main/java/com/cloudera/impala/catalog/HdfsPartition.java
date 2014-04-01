@@ -14,13 +14,11 @@
 
 package com.cloudera.impala.catalog;
 
-import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.commons.lang.ArrayUtils;
-import org.apache.hadoop.fs.BlockLocation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,10 +29,10 @@ import com.cloudera.impala.analysis.PartitionKeyValue;
 import com.cloudera.impala.thrift.ImpalaInternalServiceConstants;
 import com.cloudera.impala.thrift.TAccessLevel;
 import com.cloudera.impala.thrift.TExpr;
+import com.cloudera.impala.thrift.TExprNode;
 import com.cloudera.impala.thrift.THdfsFileBlock;
 import com.cloudera.impala.thrift.THdfsFileDesc;
 import com.cloudera.impala.thrift.THdfsPartition;
-import com.cloudera.impala.thrift.TNetworkAddress;
 import com.cloudera.impala.thrift.TTableStats;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
@@ -53,11 +51,9 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
    * TODO: Do we even need this class? Just get rid of it and use the Thrift version?
    */
   static public class FileDescriptor {
-    // TODO: split filePath into dir and file name and reuse the dir string to save
-    // memory.
     private final THdfsFileDesc fileDescriptor_;
 
-    public String getFilePath() { return fileDescriptor_.getPath(); }
+    public String getFileName() { return fileDescriptor_.getFile_name(); }
     public long getFileLength() { return fileDescriptor_.getLength(); }
     public long getModificationTime() {
       return fileDescriptor_.getLast_modification_time();
@@ -68,21 +64,21 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
 
     public THdfsFileDesc toThrift() { return fileDescriptor_; }
 
-    public FileDescriptor(String filePath, long fileLength, long modificationTime) {
-      Preconditions.checkNotNull(filePath);
+    public FileDescriptor(String fileName, long fileLength, long modificationTime) {
+      Preconditions.checkNotNull(fileName);
       Preconditions.checkArgument(fileLength >= 0);
       fileDescriptor_ = new THdfsFileDesc();
-      fileDescriptor_.setPath(filePath);
+      fileDescriptor_.setFile_name(fileName);
       fileDescriptor_.setLength(fileLength);
       fileDescriptor_.setLast_modification_time(modificationTime);
       fileDescriptor_.setCompression(
-          HdfsCompression.fromFileName(filePath).toThrift());
+          HdfsCompression.fromFileName(fileName).toThrift());
       List<THdfsFileBlock> emptyFileBlockList = Lists.newArrayList();
       fileDescriptor_.setFile_blocks(emptyFileBlockList);
     }
 
     private FileDescriptor(THdfsFileDesc fileDesc) {
-      this(fileDesc.path, fileDesc.length, fileDesc.last_modification_time);
+      this(fileDesc.getFile_name(), fileDesc.length, fileDesc.last_modification_time);
       for (THdfsFileBlock block: fileDesc.getFile_blocks()) {
         fileDescriptor_.addToFile_blocks(block);
       }
@@ -98,7 +94,8 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
 
     @Override
     public String toString() {
-      return Objects.toStringHelper(this).add("Path", getFilePath())
+      return Objects.toStringHelper(this)
+          .add("FileName", getFileName())
           .add("Length", getFileLength()).toString();
     }
   }
@@ -114,45 +111,23 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
     }
 
     /**
-     * Construct a FileBlock from blockLocation and populate the network address
-     * locations of this block from BlockLocation.getNames(). Does not fill diskIds.
+     * Construct a FileBlock given the start offset (in bytes) of the file associated
+     * with this block, the length of the block (in bytes), and the set of host IDs
+     * that contain replicas of this block. Host IDs are assigned when loading the
+     * block metadata in HdfsTable. Does not fill diskIds.
      */
-    public FileBlock(String fileName, long fileSize, BlockLocation blockLocation) {
-      Preconditions.checkNotNull(blockLocation);
+    public FileBlock(long offset, long blockLength, List<Integer> replicaHostIdxs) {
+      Preconditions.checkNotNull(replicaHostIdxs);
       fileBlock_ = new THdfsFileBlock();
-      fileBlock_.setFile_name(fileName);
-      fileBlock_.setFile_size(fileSize);
-      fileBlock_.setOffset(blockLocation.getOffset());
-      fileBlock_.setLength(blockLocation.getLength());
-
-      // result of BlockLocation.getNames(): list of (IP:port) hosting this block
-      String[] blockHostPorts;
-      try {
-        blockHostPorts = blockLocation.getNames();
-      } catch (IOException e) {
-        // this shouldn't happen, getNames() doesn't throw anything
-        String errorMsg = "BlockLocation.getNames() failed:\n" + e.getMessage();
-        LOG.error(errorMsg);
-        throw new IllegalStateException(errorMsg);
-      }
-
-      // network_addresses[i] stores this block on diskId[i]; the BE uses this information
-      // to schedule scan ranges.
-      fileBlock_.network_addresses = Lists.newArrayList();
-      for (int i = 0; i < blockHostPorts.length; ++i) {
-        String[] ip_port = blockHostPorts[i].split(":");
-        Preconditions.checkState(ip_port.length == 2);
-        fileBlock_.network_addresses.add(new TNetworkAddress(ip_port[0],
-            Integer.parseInt(ip_port[1])));
-      }
+      fileBlock_.setOffset(offset);
+      fileBlock_.setLength(blockLength);
+      fileBlock_.setReplica_host_idxs(replicaHostIdxs);
     }
 
-    public String getFileName() { return fileBlock_.getFile_name(); }
-    public long getFileSize() { return fileBlock_.getFile_size(); }
     public long getOffset() { return fileBlock_.getOffset(); }
     public long getLength() { return fileBlock_.getLength(); }
-    public List<TNetworkAddress> getNetworkAddresses() {
-      return fileBlock_.getNetwork_addresses();
+    public List<Integer> getReplicaHostIdxs() {
+      return fileBlock_.getReplica_host_idxs();
     }
 
     /**
@@ -162,7 +137,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
      */
     public static void setDiskIds(int[] diskIds, THdfsFileBlock fileBlock) {
       Preconditions.checkArgument(
-          diskIds.length == fileBlock.getNetwork_addresses().size());
+          diskIds.length == fileBlock.getReplica_host_idxs().size());
       fileBlock.setDisk_ids(Arrays.asList(ArrayUtils.toObject(diskIds)));
     }
 
@@ -302,7 +277,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
     // invalid and moving on, so that table loading won't fail and user can query other
     // partitions.
     for (FileDescriptor fileDescriptor: fileDescriptors) {
-      String result = checkFileCompressionTypeSupported(fileDescriptor.getFilePath());
+      String result = checkFileCompressionTypeSupported(fileDescriptor.getFileName());
       if (!result.isEmpty()) {
         throw new RuntimeException(result);
       }
@@ -316,7 +291,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
       List<HdfsPartition.FileDescriptor> fileDescriptors, TAccessLevel accessLevel) {
     this(table, msPartition, partitionKeyValues, fileFormatDescriptor, fileDescriptors,
         partitionIdCounter.getAndIncrement(), msPartition != null ?
-            msPartition.getSd().getLocation() : null, accessLevel);
+            msPartition.getSd().getLocation() : table.getLocation(), accessLevel);
   }
 
   public static HdfsPartition defaultPartition(
@@ -383,13 +358,13 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
       long id, THdfsPartition thriftPartition) {
     HdfsStorageDescriptor storageDesc = new HdfsStorageDescriptor(table.getName(),
         HdfsFileFormat.fromThrift(thriftPartition.getFileFormat()),
-        (char) thriftPartition.lineDelim,
-        (char) thriftPartition.fieldDelim,
-        (char) thriftPartition.collectionDelim,
-        (char) thriftPartition.mapKeyDelim,
-        (char) thriftPartition.escapeChar,
-        '"', // TODO: We should probably add quoteChar to THdfsPartition.
-        (int) thriftPartition.blockSize,
+        thriftPartition.lineDelim,
+        thriftPartition.fieldDelim,
+        thriftPartition.collectionDelim,
+        thriftPartition.mapKeyDelim,
+        thriftPartition.escapeChar,
+        (byte) '"', // TODO: We should probably add quoteChar to THdfsPartition.
+        thriftPartition.blockSize,
         thriftPartition.compression);
 
     List<LiteralExpr> literalExpr = Lists.newArrayList();
@@ -399,9 +374,9 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
         clusterCols.add(table.getColumns().get(i));
       }
 
-      List<com.cloudera.impala.thrift.TExprNode> exprNodes = Lists.newArrayList();
-      for (com.cloudera.impala.thrift.TExpr expr: thriftPartition.getPartitionKeyExprs()) {
-        for (com.cloudera.impala.thrift.TExprNode node: expr.getNodes()) {
+      List<TExprNode> exprNodes = Lists.newArrayList();
+      for (TExpr expr: thriftPartition.getPartitionKeyExprs()) {
+        for (TExprNode node: expr.getNodes()) {
           exprNodes.add(node);
         }
       }
@@ -432,22 +407,25 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
     return partition;
   }
 
-  private static LiteralExpr TExprNodeToLiteralExpr(
-      com.cloudera.impala.thrift.TExprNode exprNode, PrimitiveType primitiveType) {
+  private static LiteralExpr TExprNodeToLiteralExpr(TExprNode exprNode,
+      ColumnType primitiveType) {
     try {
       switch (exprNode.node_type) {
         case FLOAT_LITERAL:
-          return (LiteralExpr)(LiteralExpr.create(Double.toString(
+          return (LiteralExpr) (LiteralExpr.create(Double.toString(
               exprNode.float_literal.value), primitiveType).castTo(primitiveType));
         case INT_LITERAL:
-          return (LiteralExpr)(LiteralExpr.create(Long.toString(
+          return (LiteralExpr) (LiteralExpr.create(Long.toString(
               exprNode.int_literal.value), primitiveType).castTo(primitiveType));
         case STRING_LITERAL:
           return LiteralExpr.create(exprNode.string_literal.value, primitiveType);
+        case BOOL_LITERAL:
+          return LiteralExpr.create(Boolean.toString(exprNode.bool_literal.value),
+              primitiveType);
         case NULL_LITERAL:
           return new NullLiteral();
         default:
-          throw new IllegalStateException("Unsupported partition key type: " +
+          throw new UnsupportedOperationException("Unsupported partition key type: " +
               exprNode.node_type);
       }
     } catch (Exception e) {
@@ -458,12 +436,12 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
   public THdfsPartition toThrift(boolean includeFileDescriptorMetadata) {
     List<TExpr> thriftExprs = Expr.treesToThrift(getPartitionValues());
 
-    THdfsPartition thriftHdfsPart =
-        new THdfsPartition((byte)fileFormatDescriptor.getLineDelim(),
-        (byte)fileFormatDescriptor.getFieldDelim(),
-        (byte)fileFormatDescriptor.getCollectionDelim(),
-        (byte)fileFormatDescriptor.getMapKeyDelim(),
-        (byte)fileFormatDescriptor.getEscapeChar(),
+    THdfsPartition thriftHdfsPart = new THdfsPartition(
+        fileFormatDescriptor.getLineDelim(),
+        fileFormatDescriptor.getFieldDelim(),
+        fileFormatDescriptor.getCollectionDelim(),
+        fileFormatDescriptor.getMapKeyDelim(),
+        fileFormatDescriptor.getEscapeChar(),
         fileFormatDescriptor.getFileFormat().toThrift(), thriftExprs,
         fileFormatDescriptor.getBlockSize(), fileFormatDescriptor.getCompression());
     thriftHdfsPart.setLocation(location);

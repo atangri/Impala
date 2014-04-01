@@ -17,6 +17,7 @@
 #include <dlfcn.h>
 #include <sstream>
 #include "runtime/exec-env.h"
+#include "util/fe-test-info.h"
 
 using namespace std;
 
@@ -27,13 +28,13 @@ Status DynamicLookup(void* handle, const char* symbol, void** fn_ptr) {
   char* error = dlerror();
   if (error != NULL) {
     stringstream ss;
-    ss << "Unable to find " << symbol << " dlerror: " << error;
+    ss << "Unable to find " << symbol << "\ndlerror: " << error;
     return Status(ss.str());
   }
   return Status::OK;
 }
 
-Status DynamicOpen(const string& library, void** handle) {
+Status DynamicOpen(const char* library, void** handle) {
   int flags = RTLD_NOW;
   // If we are loading shared libraries from the FE tests, where the Java
   // side loads the initial impala binary (libfesupport.so), we are unable
@@ -44,14 +45,18 @@ Status DynamicOpen(const string& library, void** handle) {
   // will prevent the FE tests from running the functions that cannot resolve
   // the symbols (e.g. planner tests with some UDFs).
   // TODO: this is to work around some build breaks. We need to fix this better.
-  if (ExecEnv::GetInstance()->is_fe_tests()) flags = RTLD_LAZY;
-  *handle = dlopen(library.c_str(), flags);
+  if (FeTestInfo::is_fe_tests()) flags = RTLD_LAZY;
+  *handle = dlopen(library, flags);
   if (*handle == NULL) {
     stringstream ss;
-    ss << "Unable to load " << library << " dlerror: " << dlerror();
+    ss << "Unable to load " << library << "\ndlerror: " << dlerror();
     return Status(ss.str());
   }
   return Status::OK;
+}
+
+void DynamicClose(void* handle) {
+  dlclose(handle);
 }
 
 }

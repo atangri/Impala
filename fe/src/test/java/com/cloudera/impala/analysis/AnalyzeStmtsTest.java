@@ -20,14 +20,14 @@ import java.lang.reflect.Field;
 
 import org.junit.Test;
 
+import com.cloudera.impala.catalog.AggregateFunction;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.PrimitiveType;
-import com.cloudera.impala.catalog.Uda;
 import com.cloudera.impala.common.AnalysisException;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 
 public class AnalyzeStmtsTest extends AnalyzerTest {
-
   @Test
   public void TestFromClause() throws AnalysisException {
     AnalyzesOk("select int_col from functional.alltypes");
@@ -318,7 +318,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalysisError(
         "select a.int_col from functional.alltypes a join " +
         "functional.alltypes b on a.bool_col = b.string_col",
-        "operands are not comparable: a.bool_col = b.string_col");
+        "operands of type BOOLEAN and STRING are not comparable: "
+            + "a.bool_col = b.string_col");
     AnalyzesOk(
     "select a.int_col, b.int_col, c.int_col " +
         "from functional.alltypes a join functional.alltypes b on " +
@@ -460,10 +461,10 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "from functional.alltypes group by year(timestamp_col)");
   }
 
-  void addTestUda(String name, PrimitiveType retType, PrimitiveType... argTypes) {
+  void addTestUda(String name, ColumnType retType, ColumnType... argTypes) {
     FunctionName fnName = new FunctionName("default", name);
-    catalog_.addFunction(new Uda(fnName, new FunctionArgs(Lists.newArrayList(argTypes),
-        false), retType));
+    catalog_.addFunction(new AggregateFunction(fnName,
+        new FunctionArgs(Lists.newArrayList(argTypes), false), retType));
   }
 
   @Test
@@ -476,15 +477,17 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // TODO: if we could persist these in the catalog, we'd just use those
     // TODO: add cases where the intermediate type is not the return type when
     // the planner supports that.
-    addTestUda("AggFn", PrimitiveType.BIGINT, PrimitiveType.INT);
-    addTestUda("AggFn", PrimitiveType.BIGINT, PrimitiveType.BIGINT);
-    addTestUda("AggFn", PrimitiveType.BIGINT, PrimitiveType.DOUBLE);
-    addTestUda("AggFn", PrimitiveType.STRING,
-        PrimitiveType.STRING, PrimitiveType.STRING);
+    addTestUda("AggFn", ColumnType.BIGINT, ColumnType.INT);
+    addTestUda("AggFn", ColumnType.BIGINT, ColumnType.BIGINT);
+    addTestUda("AggFn", ColumnType.BIGINT, ColumnType.DOUBLE);
+    addTestUda("AggFn", ColumnType.STRING,
+        ColumnType.STRING, ColumnType.STRING);
 
     AnalyzesOk("select aggfn(int_col) from functional.alltypesagg");
     AnalysisError("select default.AggFn(1)",
         "aggregation without a FROM clause is not allowed");
+    AnalysisError("select aggfn(distinct int_col) from functional.alltypesagg",
+        "User defined aggregates do not support DISTINCT.");
     AnalyzesOk("select default.aggfn(int_col) from functional.alltypes");
     AnalyzesOk("select count(*) from functional.testtbl");
     AnalyzesOk("select min(id), max(id), sum(id) from functional.testtbl");
@@ -505,6 +508,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalysisError("select 1 from functional.alltypes where aggfn(1)",
         "aggregate function not allowed in WHERE clause");
 
+    AnalysisError("select count() from functional.alltypes",
+        "count() is not allowed.");
+    AnalysisError("select min() from functional.alltypes",
+        "No matching function with signature: min().");
+
     // only count() allows '*'
     AnalysisError("select avg(*) from functional.testtbl",
         "'*' can only be used in conjunction with COUNT");
@@ -517,32 +525,26 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
     // multiple args
     AnalysisError("select count(id, zip) from functional.testtbl",
-        "COUNT must have DISTINCT for multiple arguments: COUNT(id, zip)");
+        "COUNT must have DISTINCT for multiple arguments: count(id, zip)");
     AnalysisError("select min(id, zip) from functional.testtbl",
-        "MIN requires exactly one parameter");
-    AnalysisError("select max(id, zip) from functional.testtbl",
-        "MAX requires exactly one parameter");
-    AnalysisError("select sum(id, zip) from functional.testtbl",
-        "SUM requires exactly one parameter");
-    AnalysisError("select avg(id, zip) from functional.testtbl",
-        "AVG requires exactly one parameter");
+        "No matching function with signature: min(BIGINT, INT).");
     AnalysisError("select group_concat(name, '-', ',') from functional.testtbl",
-        "GROUP_CONCAT requires one or two parameters");
+        "No matching function with signature: group_concat(STRING, STRING, STRING)");
 
     // nested aggregates
     AnalysisError("select sum(count(*)) from functional.testtbl",
         "aggregate function cannot contain aggregate parameters");
     AnalysisError("select min(aggfn(int_col)) from functional.alltypes",
         "aggregate function cannot contain aggregate parameters: " +
-        "MIN(default.aggfn(int_col))");
+        "min(default.aggfn(int_col))");
 
     // wrong type
     AnalysisError("select sum(timestamp_col) from functional.alltypes",
-        "SUM requires a numeric parameter: SUM(timestamp_col)");
+        "SUM requires a numeric parameter: sum(timestamp_col)");
     AnalysisError("select sum(string_col) from functional.alltypes",
-        "SUM requires a numeric parameter: SUM(string_col)");
+        "SUM requires a numeric parameter: sum(string_col)");
     AnalysisError("select avg(string_col) from functional.alltypes",
-        "AVG requires a numeric or timestamp parameter: AVG(string_col)");
+        "AVG requires a numeric or timestamp parameter: avg(string_col)");
 
     // aggregate requires table in the FROM clause
     AnalysisError("select count(*)", "aggregation without a FROM clause is not allowed");
@@ -555,38 +557,43 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select group_concat(string_col, '-') from functional.alltypes");
     AnalyzesOk("select group_concat(string_col, string_col) from functional.alltypes");
     // test all types as arguments
-    for (PrimitiveType type: typeToLiteralValue_.keySet()) {
+    for (ColumnType type: typeToLiteralValue_.keySet()) {
       String literal = typeToLiteralValue_.get(type);
       String query1 = String.format(
           "select group_concat(%s) from functional.alltypes", literal);
       String query2 = String.format(
           "select group_concat(string_col, %s) from functional.alltypes", literal);
-      if (type == PrimitiveType.STRING || type == PrimitiveType.NULL_TYPE) {
+      if (type.getPrimitiveType() == PrimitiveType.STRING || type.isNull()) {
         AnalyzesOk(query1);
         AnalyzesOk(query2);
       } else {
         AnalysisError(query1,
-            "GROUP_CONCAT requires first parameter to be of type STRING");
+            "No matching function with signature: group_concat(");
         AnalysisError(query2,
-            "GROUP_CONCAT requires second parameter to be of type STRING");
+            "No matching function with signature: group_concat(");
       }
     }
 
     // Test distinct estimate
-    for (PrimitiveType type: typeToLiteralValue_.keySet()) {
-      AnalyzesOk(String.format(
-          "select distinctpc(%s) from functional.alltypes",
-          typeToLiteralValue_.get(type)));
+    for (ColumnType type: typeToLiteralValue_.keySet()) {
       AnalyzesOk(String.format(
           "select ndv(%s) from functional.alltypes",
           typeToLiteralValue_.get(type)));
     }
+
+    // Decimal
+    AnalyzesOk("select min(d1), max(d2), count(d3), sum(d4) "
+        + "from functional.decimal_tbl");
+    AnalyzesOk("select ndv(d1), distinctpc(d2), distinctpcsa(d3), count(distinct d4) "
+        + "from functional.decimal_tbl");
+    AnalyzesOk("select avg(d5) from functional.decimal_tbl");
+    AnalysisError("select group_concat(d5) from functional.decimal_tbl",
+        "No matching function with signature: group_concat(DECIMAL(10,5))");
   }
 
   @Test
   public void TestDistinct() throws AnalysisException {
     AnalyzesOk("select count(distinct id) as sum_id from functional.testtbl");
-    // DISTINCT
     AnalyzesOk("select count(distinct id) as sum_id from " +
         "functional.testtbl order by sum_id");
     AnalyzesOk("select count(distinct id) as sum_id from " +
@@ -608,6 +615,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         + "from functional.alltypesagg group by 1");
     AnalyzesOk("select tinyint_col, count(distinct int_col),"
         + "sum(distinct int_col) from functional.alltypesagg group by 1");
+    AnalyzesOk("select avg(DISTINCT(tinyint_col)) from functional.alltypesagg");
+
+    // SUM(DISTINCT) and AVG(DISTINCT) with duplicate grouping exprs (IMPALA-847).
+    AnalyzesOk("select sum(distinct t1.bigint_col), avg(distinct t1.bigint_col) " +
+        "from functional.alltypes t1 group by t1.int_col, t1.int_col");
+
     AnalysisError("select tinyint_col, count(distinct int_col),"
         + "sum(distinct bigint_col) from functional.alltypesagg group by 1",
         "all DISTINCT aggregate functions need to have the same set of parameters");
@@ -616,7 +629,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         + "min(distinct smallint_col), max(distinct string_col) "
         + "from functional.alltypesagg group by 1");
     AnalysisError("select group_concat(distinct name) from functional.testtbl",
-            "GROUP_CONCAT does not support DISTINCT");
+            "GROUP_CONCAT() does not support DISTINCT");
   }
 
   @Test
@@ -689,6 +702,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // ok for constants in select list not to be in group by list
     AnalyzesOk("select true, NULL, 1*2+5 as a, zip, count(*) from functional.testtbl " +
         "group by zip");
+    AnalyzesOk("select d1, d2, count(*) from functional.decimal_tbl " +
+        "group by 1, 2");
 
     // doesn't group by all non-agg select list items
     AnalysisError("select zip, count(*) from functional.testtbl",
@@ -772,6 +787,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select zip, id from functional.testtbl order by zip desc");
     AnalyzesOk("select zip, id from functional.testtbl " +
         "order by true asc, false desc, NULL asc");
+    AnalyzesOk("select d1, d2 from functional.decimal_tbl order by d1");
 
     // resolves ordinals
     AnalyzesOk("select zip, id from functional.testtbl order by 1");
@@ -1341,7 +1357,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "select * from functional.alltypes",
         "Unable to INSERT into target table (functional_seq.alltypes) because Impala " +
         "does not have WRITE access to at least one HDFS path: " +
-        "hdfs://localhost:20500/test-warehouse/alltypes_seq/year=2009/month=1");
+        "hdfs://localhost:20500/test-warehouse/alltypes_seq/year=2009/month=");
 
     // Test plan hints for partitioned Hdfs tables.
     AnalyzesOk("insert into functional.alltypessmall " +
@@ -1832,7 +1848,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
    */
   @Test
   public void cloneTest() {
-    testNumberOfMembers(QueryStmt.class, 10);
+    testNumberOfMembers(QueryStmt.class, 9);
     testNumberOfMembers(UnionStmt.class, 7);
     testNumberOfMembers(ValuesStmt.class, 0);
 

@@ -20,6 +20,7 @@
 #include "common/object-pool.h"
 #include "common/status.h"
 #include "exprs/expr.h"
+#include "exprs/aggregate-functions.h"
 #include "exprs/anyval-util.h"
 #include "exprs/arithmetic-expr.h"
 #include "exprs/binary-predicate.h"
@@ -28,6 +29,7 @@
 #include "exprs/cast-expr.h"
 #include "exprs/char-literal.h"
 #include "exprs/compound-predicate.h"
+#include "exprs/conditional-functions.h"
 #include "exprs/date-literal.h"
 #include "exprs/float-literal.h"
 #include "exprs/function-call.h"
@@ -36,19 +38,25 @@
 #include "exprs/int-literal.h"
 #include "exprs/is-null-predicate.h"
 #include "exprs/like-predicate.h"
+#include "exprs/math-functions.h"
+#include "exprs/native-udf-expr.h"
 #include "exprs/null-literal.h"
-#include "exprs/opcode-registry.h"
+#include "exprs/string-functions.h"
 #include "exprs/string-literal.h"
+#include "exprs/timestamp-functions.h"
 #include "exprs/timestamp-literal.h"
 #include "exprs/tuple-is-null-predicate.h"
-#include "exprs/native-udf-expr.h"
+#include "exprs/udf-builtins.h"
+#include "exprs/utility-functions.h"
 #include "gen-cpp/Exprs_types.h"
 #include "gen-cpp/Data_types.h"
+#include "runtime/lib-cache.h"
 #include "runtime/runtime-state.h"
 #include "runtime/raw-value.h"
 
 #include "gen-cpp/Exprs_types.h"
 #include "gen-cpp/ImpalaService_types.h"
+#include "opcode/functions.h"
 
 using namespace std;
 using namespace impala;
@@ -65,55 +73,24 @@ bool ParseString(const string& str, T* val) {
   return !stream.fail();
 }
 
-void* ExprValue::TryParse(const string& str, PrimitiveType type) {
-  switch(type) {
-    case TYPE_NULL:
-      return NULL;
-    case TYPE_BOOLEAN:
-      if (ParseString<bool>(str, &bool_val)) return &bool_val;
-      break;
-    case TYPE_TINYINT:
-      if (ParseString<int8_t>(str, &tinyint_val)) return &tinyint_val;
-      break;
-    case TYPE_SMALLINT:
-      if (ParseString<int16_t>(str, &smallint_val)) return &smallint_val;
-      break;
-    case TYPE_INT:
-      if (ParseString<int32_t>(str, &int_val)) return &int_val;
-      break;
-    case TYPE_BIGINT:
-      if (ParseString<int64_t>(str, &bigint_val)) return &bigint_val;
-      break;
-    case TYPE_FLOAT:
-      if (ParseString<float>(str, &float_val)) return &float_val;
-      break;
-    case TYPE_DOUBLE:
-      if (ParseString<double>(str, &double_val)) return &double_val;
-      break;
-    case TYPE_STRING:
-      SetStringVal(str);
-      return &string_val;
-    default:
-      DCHECK(false) << "Invalid type.";
-  }
-  return NULL;
-}
-
 Expr::Expr(const ColumnType& type, bool is_slotref)
-    : compute_fn_(NULL),
-      opcode_(TExprOpcode::INVALID_OPCODE),
+    : cache_entry_(NULL),
+      is_udf_call_(false),
+      compute_fn_(NULL),
       is_slotref_(is_slotref),
       type_(type),
       output_scale_(-1),
       codegen_fn_(NULL),
       adapter_fn_used_(false),
       scratch_buffer_size_(0),
+      opened_(false) ,
       jitted_compute_fn_(NULL) {
 }
 
 Expr::Expr(const TExprNode& node, bool is_slotref)
-    : compute_fn_(NULL),
-      opcode_(node.__isset.opcode ? node.opcode : TExprOpcode::INVALID_OPCODE),
+    : cache_entry_(NULL),
+      is_udf_call_(false),
+      compute_fn_(NULL),
       is_slotref_(is_slotref),
       type_(ColumnType(node.type)),
       output_scale_(-1),
@@ -121,6 +98,21 @@ Expr::Expr(const TExprNode& node, bool is_slotref)
       adapter_fn_used_(false),
       scratch_buffer_size_(0),
       jitted_compute_fn_(NULL) {
+  if (node.__isset.fn) fn_ = node.fn;
+}
+
+Expr::~Expr() {
+  DCHECK(cache_entry_ == NULL) << "Need to call Close()";
+}
+
+void Expr::Close(RuntimeState* state) {
+  for (int i = 0; i < children_.size(); ++i) {
+    children_[i]->Close(state);
+  }
+  if (cache_entry_ != NULL) {
+    LibCache::instance()->DecrementUseCount(cache_entry_);
+    cache_entry_ = NULL;
+  }
 }
 
 Status Expr::CreateExprTree(ObjectPool* pool, const TExpr& texpr, Expr** root_expr) {
@@ -308,7 +300,6 @@ Status Expr::CreateExpr(ObjectPool* pool, const TExprNode& texpr_node, Expr** ex
       *expr = pool->Add(new FloatLiteral(texpr_node));
       return Status::OK;
     case TExprNodeType::COMPUTE_FUNCTION_CALL:
-      DCHECK(texpr_node.__isset.opcode);
       *expr = pool->Add(new FunctionCall(texpr_node));
       return Status::OK;
     case TExprNodeType::INT_LITERAL:
@@ -351,10 +342,10 @@ Status Expr::CreateExpr(ObjectPool* pool, const TExprNode& texpr_node, Expr** ex
       *expr = pool->Add(new TupleIsNullPredicate(texpr_node));
       return Status::OK;
     case TExprNodeType::FUNCTION_CALL:
-      if (!texpr_node.__isset.fn_call_expr) {
-        return Status("Udf call not set in thrift node");
+      if (!texpr_node.__isset.fn) {
+        return Status("Function not set in thrift node");
       }
-      if (texpr_node.fn_call_expr.fn.binary_type == TFunctionBinaryType::HIVE) {
+      if (texpr_node.fn.binary_type == TFunctionBinaryType::HIVE) {
         *expr = pool->Add(new HiveUdfCall(texpr_node));
       } else {
         *expr = pool->Add(new NativeUdfExpr(texpr_node));
@@ -394,11 +385,11 @@ int Expr::ComputeResultsLayout(const vector<Expr*>& exprs, vector<int>* offsets,
   // Collect all the byte sizes and sort them
   for (int i = 0; i < exprs.size(); ++i) {
     data[i].expr_idx = i;
-    if (exprs[i]->type() == TYPE_STRING) {
+    if (exprs[i]->type().type == TYPE_STRING) {
       data[i].byte_size = 16;
       data[i].variable_length = true;
     } else {
-      data[i].byte_size = GetByteSize(exprs[i]->type());
+      data[i].byte_size = exprs[i]->type().GetByteSize();
       data[i].variable_length = false;
     }
     DCHECK_NE(data[i].byte_size, 0);
@@ -488,6 +479,12 @@ void Expr::GetValue(TupleRow* row, bool as_ascii, TColumnValue* col_val) {
   }
 }
 
+void Expr::Close(const vector<Expr*>& exprs, RuntimeState* state) {
+  for (int i = 0; i < exprs.size(); ++i) {
+    exprs[i]->Close(state);
+  }
+}
+
 Status Expr::PrepareChildren(RuntimeState* state, const RowDescriptor& row_desc) {
   DCHECK(type_.type != INVALID_TYPE);
   for (int i = 0; i < children_.size(); ++i) {
@@ -522,17 +519,34 @@ bool Expr::codegend_fn_thread_safe() const {
 }
 
 Status Expr::Prepare(RuntimeState* state, const RowDescriptor& row_desc) {
-  PrepareChildren(state, row_desc);
-  // Not all exprs have opcodes (i.e. literals)
-  DCHECK(opcode_ != TExprOpcode::INVALID_OPCODE);
-  void* compute_fn_ptr =
-      OpcodeRegistry::Instance()->GetFunctionPtr(opcode_);
-  if (compute_fn_ptr == NULL) {
-    stringstream out;
-    out << "Expr::Prepare(): Opcode: " << opcode_ << " does not have a registry entry. ";
-    return Status(out.str());
+  if (type() == TYPE_DECIMAL) return Status("DECIMAL is not yet implemented.");
+  RETURN_IF_ERROR(PrepareChildren(state, row_desc));
+  if (is_udf_call_) return Status::OK;
+
+  // Not all exprs have a function set (i.e. literals)
+  if (fn_.__isset.scalar_fn) {
+    if (!fn_.scalar_fn.symbol.empty()) {
+      DCHECK_EQ(fn_.binary_type, TFunctionBinaryType::BUILTIN);
+      void* fn_ptr;
+      Status status = LibCache::instance()->GetSoFunctionPtr(
+          "", fn_.scalar_fn.symbol, &fn_ptr, &cache_entry_);
+      if (!status.ok()) {
+        // Builtins symbols should exist unless there is a version mismatch.
+        stringstream ss;
+        ss << "Builtin '" << fn_.name.function_name << "' with symbol '"
+           << fn_.scalar_fn.symbol << "' does not exist. "
+           << "Verify that all your impalads are the same version.";
+        status.AddErrorMsg(ss.str());
+        return status;
+      }
+      DCHECK(fn_ptr != NULL);
+      compute_fn_ = reinterpret_cast<ComputeFn>(fn_ptr);
+    } else {
+      stringstream ss;
+      ss << "Function " << fn_.name.function_name << " is not implemented.";
+      return Status(ss.str());
+    }
   }
-  compute_fn_ = reinterpret_cast<ComputeFn>(compute_fn_ptr);
   return Status::OK;
 }
 
@@ -542,6 +556,22 @@ Status Expr::Prepare(const vector<Expr*>& exprs, RuntimeState* state,
   for (int i = 0; i < exprs.size(); ++i) {
     RETURN_IF_ERROR(Prepare(exprs[i], state, row_desc, disable_codegen, thread_safe));
   }
+  return Status::OK;
+}
+
+Status Expr::Open(const vector<Expr*>& exprs, RuntimeState* state) {
+  // TODO: call prepare function with FRAGMENT_LOCAL scope
+  for (int i = 0; i < exprs.size(); ++i) {
+    RETURN_IF_ERROR(exprs[i]->Open(state));
+  }
+  return Status::OK;
+}
+
+Status Expr::Open(RuntimeState* state) {
+  for (int i = 0; i < children_.size(); ++i) {
+    RETURN_IF_ERROR(children_[i]->Open(state));
+  }
+  opened_ = true;
   return Status::OK;
 }
 
@@ -556,9 +586,6 @@ string Expr::DebugString() const {
   // TODO: implement partial debug string for member vars
   stringstream out;
   out << " type=" << type_.DebugString();
-  if (opcode_ != TExprOpcode::INVALID_OPCODE) {
-    out << " opcode=" << opcode_;
-  }
   out << " codegen=" << (codegen_fn_ == NULL ? "false" : "true");
   if (!children_.empty()) {
     out << " children=" << DebugString(children_);
@@ -592,9 +619,9 @@ int Expr::GetSlotIds(vector<SlotId>* slot_ids) const {
 }
 
 Type* Expr::GetLlvmReturnType(LlvmCodeGen* codegen) const {
-  if (type() == TYPE_STRING) {
+  if (type().type == TYPE_STRING) {
     return codegen->GetPtrType(TYPE_STRING);
-  } else  if (type() == TYPE_TIMESTAMP) {
+  } else  if (type().type == TYPE_TIMESTAMP) {
     // TODO
     return NULL;
   } else {
@@ -620,7 +647,7 @@ Function* Expr::CreateComputeFnPrototype(LlvmCodeGen* codegen, const string& nam
 }
 
 Value* Expr::GetNullReturnValue(LlvmCodeGen* codegen) {
-  switch (type()) {
+  switch (type().type) {
     case TYPE_NULL:
       return ConstantInt::get(codegen->context(), APInt(1, 0, true));
     case TYPE_BOOLEAN:
@@ -691,7 +718,7 @@ void* Expr::EvalCodegendComputeFn(Expr* expr, TupleRow* row) {
   void* func = expr->jitted_compute_fn_;
   void* result = NULL;
   bool is_null = false;
-  switch (expr->type()) {
+  switch (expr->type().type) {
     case TYPE_NULL: {
       is_null = true;
       break;
@@ -758,7 +785,7 @@ void Expr::SetComputeFn(void* jitted_function, int scratch_size) {
 }
 
 bool Expr::IsJittable(LlvmCodeGen* codegen) const {
-  if (type() == TYPE_TIMESTAMP || type() == TYPE_CHAR) return false;
+  if (type().type == TYPE_TIMESTAMP || type().type == TYPE_CHAR) return false;
   for (int i = 0; i < GetNumChildren(); ++i) {
     if (!children()[i]->IsJittable(codegen)) return false;
   }
@@ -835,7 +862,7 @@ Function* Expr::Codegen(LlvmCodeGen* codegen) {
 
   builder.SetInsertPoint(not_null_block);
   // Convert the void* ComputeFn return value to the typed llvm version
-  switch (type()) {
+  switch (type().type) {
     case TYPE_NULL:
       builder.CreateRet(codegen->false_value());
       break;
@@ -951,6 +978,94 @@ Function* Expr::CreateIrFunctionPrototype(LlvmCodeGen* codegen, const string& na
   Function* function = prototype.GeneratePrototype(NULL, args[0]);
   DCHECK(function != NULL);
   return function;
+}
+
+void Expr::InitBuiltinsDummy() {
+  // Call one function from each of the classes to pull all the symbols
+  // from that class in.
+  // TODO: is there a better way to do this?
+  AggregateFunctions::InitNull(NULL, NULL);
+  ComputeFunctions::Add_char_char(NULL, NULL);
+  ConditionalFunctions::IsNull(NULL, NULL);
+  MathFunctions::Pi(NULL, NULL);
+  StringFunctions::Length(NULL, NULL);
+  TimestampFunctions::Year(NULL, NULL);
+  UdfBuiltins::Pi(NULL);
+  UtilityFunctions::Pid(NULL, NULL);
+}
+
+AnyVal* Expr::GetConstVal() {
+  DCHECK(opened_);
+  if (!IsConstant()) return NULL;
+  if (constant_val_.get() != NULL) return constant_val_.get();
+
+  void* val = GetValue(NULL);
+  switch (type_.type) {
+    case TYPE_BOOLEAN: {
+      BooleanVal v = BooleanVal::null();
+      if (val != NULL) v = BooleanVal(*reinterpret_cast<bool*>(val));
+      constant_val_.reset(new BooleanVal(v));
+      break;
+    }
+    case TYPE_TINYINT: {
+      TinyIntVal v = TinyIntVal::null();
+      if (val != NULL) v = TinyIntVal(*reinterpret_cast<int8_t*>(val));
+      constant_val_.reset(new TinyIntVal(v));
+      break;
+    }
+    case TYPE_SMALLINT: {
+      SmallIntVal v = SmallIntVal::null();
+      if (val != NULL) v = SmallIntVal(*reinterpret_cast<int16_t*>(val));
+      constant_val_.reset(new SmallIntVal(v));
+      break;
+    }
+    case TYPE_INT: {
+      IntVal v = IntVal::null();
+      if (val != NULL) v = IntVal(*reinterpret_cast<int32_t*>(val));
+      constant_val_.reset(new IntVal(v));
+      break;
+    }
+    case TYPE_BIGINT: {
+      BigIntVal v = BigIntVal::null();
+      if (val != NULL) v = BigIntVal(*reinterpret_cast<int64_t*>(val));
+      constant_val_.reset(new BigIntVal(v));
+      break;
+    }
+    case TYPE_FLOAT: {
+      FloatVal v = FloatVal::null();
+      if (val != NULL) v = FloatVal(*reinterpret_cast<float*>(val));
+      constant_val_.reset(new FloatVal(v));
+      break;
+    }
+    case TYPE_DOUBLE: {
+      DoubleVal v = DoubleVal::null();
+      if (val != NULL) v = DoubleVal(*reinterpret_cast<double*>(val));
+      constant_val_.reset(new DoubleVal(v));
+      break;
+    }
+    case TYPE_STRING: {
+      StringVal v = StringVal::null();
+      if (val != NULL) {
+        StringValue* sv = reinterpret_cast<StringValue*>(val);
+        sv->ToStringVal(&v);
+      }
+      constant_val_.reset(new StringVal(v));
+      break;
+    }
+    case TYPE_TIMESTAMP: {
+      TimestampVal v = TimestampVal::null();
+      if (val != NULL) {
+        TimestampValue* tv = reinterpret_cast<TimestampValue*>(val);
+        tv->ToTimestampVal(&v);
+      }
+      constant_val_.reset(new TimestampVal(v));
+      break;
+    }
+    default:
+      DCHECK(false) << "Type not implemented: " << type();
+  }
+  DCHECK(constant_val_.get() != NULL);
+  return constant_val_.get();
 }
 
 }

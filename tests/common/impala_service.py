@@ -51,9 +51,10 @@ class BaseImpalaService(object):
       sleep(interval)
     assert 0, 'Debug webpage did not become available in expected time.'
 
-  def get_metric_value(self, metric_name):
+  def get_metric_value(self, metric_name, default_value=None):
     """Returns the value of the the given metric name from the Impala debug webpage"""
-    return json.loads(self.read_debug_webpage('jsonmetrics'))[metric_name]
+    metrics = json.loads(self.read_debug_webpage('jsonmetrics'))
+    return metrics.get(metric_name, default_value)
 
   def wait_for_metric_value(self, metric_name, expected_value, timeout=10, interval=1):
     start_time = time()
@@ -91,6 +92,12 @@ class ImpaladService(BaseImpalaService):
     result = self.read_debug_webpage('backends?raw', timeout, interval)
     match = re.match(r'Known Backends \((\d+)\)', result)
     return None if match is None else int(match.group(1))
+
+  def get_num_in_flight_queries(self, timeout=30, interval=1):
+    LOG.info("Getting num_in_flight_queries from %s:%s" %\
+        (self.hostname, self.webserver_port))
+    result = self.read_debug_webpage('inflight_query_ids?raw', timeout, interval)
+    return None if result is None else len([l for l in result.split('\n') if l])
 
   def wait_for_num_known_live_backends(self, expected_value, timeout=30, interval=1):
     start_time = time()
@@ -163,6 +170,11 @@ class ImpaladService(BaseImpalaService):
     client.connect()
     return client
 
+  def get_catalog_object_dump(self, object_type, object_name):
+    return self.read_debug_webpage('catalog_objects?object_type=%s&object_name=%s' %\
+        (object_type, object_name))
+
+
 # Allows for interacting with the StateStore service to perform operations such as
 # accessing the debug webpage.
 class StateStoredService(BaseImpalaService):
@@ -180,3 +192,7 @@ class CatalogdService(BaseImpalaService):
   def __init__(self, hostname, webserver_port, service_port):
     super(CatalogdService, self).__init__(hostname, webserver_port)
     self.service_port = service_port
+
+  def get_catalog_object_dump(self, object_type, object_name):
+    return self.read_debug_webpage('catalog_objects?object_type=%s&object_name=%s' %\
+        (object_type, object_name))

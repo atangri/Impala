@@ -54,6 +54,7 @@ Status HdfsParquetScanner::IssueInitialRanges(HdfsScanNode* scan_node,
       // Since Parquet scanners always read entire files, only read a file if we're
       // assigned the first split to avoid reading multi-block files with multiple
       // scanners.
+      // We only process the split that starts at offset 0.
       if (split->offset() != 0) {
         // We are expecting each file to be one hdfs block (so all the scan range offsets
         // should be 0).  This is not incorrect but we will issue a warning.
@@ -73,10 +74,10 @@ Status HdfsParquetScanner::IssueInitialRanges(HdfsScanNode* scan_node,
       int64_t footer_start = files[i]->file_length - footer_size;
 
       ScanRangeMetadata* metadata =
-          reinterpret_cast<ScanRangeMetadata*>(files[i]->splits[0]->meta_data());
+          reinterpret_cast<ScanRangeMetadata*>(split->meta_data());
       DiskIoMgr::ScanRange* footer_range = scan_node->AllocateScanRange(
           files[i]->filename.c_str(), footer_size,
-          footer_start, metadata->partition_id, files[i]->splits[0]->disk_id());
+          footer_start, metadata->partition_id, split->disk_id(), split->try_cache());
       footer_ranges.push_back(footer_range);
     }
   }
@@ -230,7 +231,7 @@ class HdfsParquetScanner::ColumnReader : public HdfsParquetScanner::BaseColumnRe
  public:
   ColumnReader(HdfsParquetScanner* parent, const SlotDescriptor* desc, int file_idx)
     : BaseColumnReader(parent, desc, file_idx) {
-    DCHECK_NE(desc->type(), TYPE_BOOLEAN);
+    DCHECK_NE(desc->type().type, TYPE_BOOLEAN);
   }
 
  protected:
@@ -259,7 +260,9 @@ class HdfsParquetScanner::ColumnReader : public HdfsParquetScanner::BaseColumnRe
     } else {
       DCHECK(page_encoding == parquet::Encoding::PLAIN);
       data_ += ParquetPlainEncoder::Decode<T>(data_, reinterpret_cast<T*>(slot));
-      if (stream_->compact_data()) CopySlot(reinterpret_cast<T*>(slot), pool);
+      if (parent_->scan_node_->requires_compaction()) {
+        CopySlot(reinterpret_cast<T*>(slot), pool);
+      }
       return true;
     }
     return result;
@@ -286,7 +289,7 @@ class HdfsParquetScanner::BoolColumnReader : public HdfsParquetScanner::BaseColu
  public:
   BoolColumnReader(HdfsParquetScanner* parent, const SlotDescriptor* desc, int file_idx)
     : BaseColumnReader(parent, desc, file_idx) {
-    DCHECK_EQ(desc->type(), TYPE_BOOLEAN);
+    DCHECK_EQ(desc->type().type, TYPE_BOOLEAN);
   }
 
  protected:
@@ -327,12 +330,14 @@ void HdfsParquetScanner::Close() {
   vector<THdfsCompression::type> compression_types;
   for (int i = 0; i < column_readers_.size(); ++i) {
     if (column_readers_[i]->decompressed_data_pool_.get() != NULL) {
-      AttachPool(column_readers_[i]->decompressed_data_pool_.get());
+      // No need to commit the row batches with the AttachPool() calls
+      // since AddFinalRowBatch() already does below.
+      AttachPool(column_readers_[i]->decompressed_data_pool_.get(), false);
     }
     column_readers_[i]->Close();
     compression_types.push_back(column_readers_[i]->codec());
   }
-  AttachPool(dictionary_pool_.get());
+  AttachPool(dictionary_pool_.get(), false);
   AddFinalRowBatch();
 
   // If this was a metadata only read (i.e. count(*)), there are no columns.
@@ -347,7 +352,7 @@ void HdfsParquetScanner::Close() {
 HdfsParquetScanner::BaseColumnReader* HdfsParquetScanner::CreateReader(
     SlotDescriptor* desc, int file_idx) {
   BaseColumnReader* reader = NULL;
-  switch (desc->type()) {
+  switch (desc->type().type) {
     case TYPE_BOOLEAN:
       reader = new BoolColumnReader(this, desc, file_idx);
       break;
@@ -397,7 +402,7 @@ Status HdfsParquetScanner::BaseColumnReader::ReadDataPage() {
 
   // We're about to move to the next data page.  The previous data page is
   // now complete, pass along the memory allocated for it.
-  parent_->AttachPool(decompressed_data_pool_.get());
+  parent_->AttachPool(decompressed_data_pool_.get(), false);
 
   // Read the next data page, skipping page types we don't care about.
   // We break out of this loop on the non-error case (a data page was found or we read all
@@ -426,7 +431,8 @@ Status HdfsParquetScanner::BaseColumnReader::ReadDataPage() {
 
     // We don't know the actual header size until the thrift object is deserialized.
     uint32_t header_size = num_bytes;
-    status = DeserializeThriftMsg(buffer, &header_size, true, &current_page_header_);
+    status = DeserializeThriftMsg(
+        buffer, &header_size, true, &current_page_header_, true);
     if (!status.ok()) {
       if (header_size >= MAX_PAGE_HEADER_SIZE) {
         status.AddErrorMsg("ParquetScanner: Could not deserialize page header.");
@@ -464,7 +470,7 @@ Status HdfsParquetScanner::BaseColumnReader::ReadDataPage() {
       if (dict_decoder_base_ != NULL) {
         return Status("Column chunk should not contain two dictionary pages.");
       }
-      if (desc_->type() == TYPE_BOOLEAN) {
+      if (desc_->type().type == TYPE_BOOLEAN) {
         return Status("Unexpected dictionary page. Dictionary page is not"
             " supported for booleans.");
       }
@@ -490,6 +496,7 @@ Status HdfsParquetScanner::BaseColumnReader::ReadDataPage() {
         dict_values = parent_->dictionary_pool_->Allocate(uncompressed_size);
         RETURN_IF_ERROR(decompressor_->ProcessBlock(true, data_size, data_,
             &uncompressed_size, &dict_values));
+        VLOG_FILE << "Decompressed " << data_size << " to " << uncompressed_size;
         data_size = uncompressed_size;
       } else {
         DCHECK_EQ(data_size, current_page_header_.uncompressed_page_size);
@@ -527,6 +534,8 @@ Status HdfsParquetScanner::BaseColumnReader::ReadDataPage() {
       RETURN_IF_ERROR(decompressor_->ProcessBlock(
           true, current_page_header_.compressed_page_size, data_,
           &uncompressed_size, &decompressed_buffer));
+      VLOG_FILE << "Decompressed " << current_page_header_.compressed_page_size
+                << " to " << uncompressed_size;
       DCHECK_EQ(current_page_header_.uncompressed_page_size, uncompressed_size);
       data_ = decompressed_buffer;
       data_size = current_page_header_.uncompressed_page_size;
@@ -644,6 +653,8 @@ Status HdfsParquetScanner::ProcessSplit() {
     // streams could either be just the footer stream or streams for the previous row
     // group.
     context_->AttachCompletedResources(batch_, /* done */ true);
+    // Commit the rows to flush the row batch from the previous row group
+    CommitRows(0);
 
     RETURN_IF_ERROR(InitColumns(i));
     RETURN_IF_ERROR(AssembleRows());
@@ -698,94 +709,128 @@ Status HdfsParquetScanner::AssembleRows() {
 Status HdfsParquetScanner::ProcessFooter(bool* eosr) {
   *eosr = false;
 
-  // Need to loop in case we need to read more bytes.
-  while (true) {
-    uint8_t* buffer;
-    int len;
+  uint8_t* buffer;
+  int len;
 
-    RETURN_IF_ERROR(stream_->GetBuffer(false, &buffer, &len));
-    DCHECK(stream_->eosr());
+  RETURN_IF_ERROR(stream_->GetBuffer(false, &buffer, &len));
+  DCHECK(stream_->eosr());
 
-    // Number of bytes in buffer after the fixed size footer is accounted for.
-    int remaining_bytes_buffered = len - sizeof(int32_t) - sizeof(PARQUET_VERSION_NUMBER);
+  // Number of bytes in buffer after the fixed size footer is accounted for.
+  int remaining_bytes_buffered = len - sizeof(int32_t) - sizeof(PARQUET_VERSION_NUMBER);
 
-    // Make sure footer has enough bytes to contain the required information.
-    if (remaining_bytes_buffered < 0) {
-      stringstream ss;
-      ss << "File " << stream_->filename() << " is invalid.  Missing metadata.";
-      return Status(ss.str());
-    }
-
-    // Validate magic file bytes are correct
-    uint8_t* magic_number_ptr = buffer + len - sizeof(PARQUET_VERSION_NUMBER);
-    if (memcmp(magic_number_ptr,
-        PARQUET_VERSION_NUMBER, sizeof(PARQUET_VERSION_NUMBER) != 0)) {
-      stringstream ss;
-      ss << "File " << stream_->filename() << " is invalid.  Invalid file footer: "
-         << string((char*)magic_number_ptr, sizeof(PARQUET_VERSION_NUMBER));
-      return Status(ss.str());
-    }
-
-    // The size of the metadata is encoded as a 4 byte little endian value before
-    // the magic number
-    uint8_t* metadata_size_ptr = magic_number_ptr - sizeof(int32_t);
-    uint32_t metadata_size = *reinterpret_cast<uint32_t*>(metadata_size_ptr);
-
-    // TODO: we need to read more from the file, the footer size guess was wrong.
-    DCHECK_LE(metadata_size, remaining_bytes_buffered);
-
-    // Deserialize file header
-    uint8_t* metadata_ptr = metadata_size_ptr - metadata_size;
-    Status status =
-        DeserializeThriftMsg(metadata_ptr, &metadata_size, true, &file_metadata_);
-    if (!status.ok()) {
-      stringstream ss;
-      ss << "File " << stream_->filename() << " has invalid file metadata at file offset "
-         << (metadata_size + sizeof(PARQUET_VERSION_NUMBER) + sizeof(uint32_t)) << ". "
-         << "Error = " << status.GetErrorMsg();
-      return Status(ss.str());
-    }
-
-    metadata_range_ = stream_->scan_range();
-    RETURN_IF_ERROR(ValidateFileMetadata());
-
-    // Tell the scan node this file has been taken care of.
-    HdfsFileDesc* desc = scan_node_->GetFileDesc(stream_->filename());
-    scan_node_->MarkFileDescIssued(desc);
-
-    if (scan_node_->materialized_slots().empty()) {
-      // No materialized columns.  We can serve this query from just the metadata.  We
-      // don't need to read the column data.
-      int64_t num_tuples = file_metadata_.num_rows;
-      COUNTER_UPDATE(scan_node_->rows_read_counter(), num_tuples);
-
-      while (num_tuples > 0) {
-        MemPool* pool;
-        Tuple* tuple;
-        TupleRow* current_row;
-        int max_tuples = GetMemory(&pool, &tuple, &current_row);
-        max_tuples = min(static_cast<int64_t>(max_tuples), num_tuples);
-        num_tuples -= max_tuples;
-
-        int num_to_commit = WriteEmptyTuples(context_, current_row, max_tuples);
-        RETURN_IF_ERROR(CommitRows(num_to_commit));
-      }
-
-      *eosr = true;
-      return Status::OK;
-    } else if (file_metadata_.num_rows == 0) {
-      // Empty file
-      *eosr = true;
-      return Status::OK;
-    }
-
-    if (file_metadata_.row_groups.empty()) {
-      stringstream ss;
-      ss << "Invalid file. This file: " << stream_->filename() << " has no row groups";
-      return Status(ss.str());
-    }
-    break;
+  // Make sure footer has enough bytes to contain the required information.
+  if (remaining_bytes_buffered < 0) {
+    stringstream ss;
+    ss << "File " << stream_->filename() << " is invalid.  Missing metadata.";
+    return Status(ss.str());
   }
+
+  // Validate magic file bytes are correct
+  uint8_t* magic_number_ptr = buffer + len - sizeof(PARQUET_VERSION_NUMBER);
+  if (memcmp(magic_number_ptr,
+      PARQUET_VERSION_NUMBER, sizeof(PARQUET_VERSION_NUMBER) != 0)) {
+    stringstream ss;
+    ss << "File " << stream_->filename() << " is invalid.  Invalid file footer: "
+        << string((char*)magic_number_ptr, sizeof(PARQUET_VERSION_NUMBER));
+    return Status(ss.str());
+  }
+
+  // The size of the metadata is encoded as a 4 byte little endian value before
+  // the magic number
+  uint8_t* metadata_size_ptr = magic_number_ptr - sizeof(int32_t);
+  uint32_t metadata_size = *reinterpret_cast<uint32_t*>(metadata_size_ptr);
+  uint8_t* metadata_ptr = metadata_size_ptr - metadata_size;
+  // If the metadata was too big, we need to stitch it before deserializing it.
+  // In that case, we stitch the data in this buffer.
+  vector<uint8_t> metadata_buffer;
+  metadata_range_ = stream_->scan_range();
+
+  if (UNLIKELY(metadata_size > remaining_bytes_buffered)) {
+    // In this case, the metadata is bigger than our guess meaning there are
+    // not enough bytes in the footer range from IssueInitialRanges().
+    // We'll just issue more ranges to the IoMgr that is the actual footer.
+    const HdfsFileDesc* file_desc = scan_node_->GetFileDesc(metadata_range_->file());
+    // The start of the metadata is:
+    // file_length - 4-byte metadata size - footer-size - metadata size
+    int64_t metadata_start = file_desc->file_length -
+      sizeof(int32_t) - sizeof(PARQUET_VERSION_NUMBER) - metadata_size;
+    int metadata_bytes_to_read = metadata_size;
+
+    // IoMgr can only do a fixed size Read(). The metadata could be larger
+    // so we stitch it here.
+    // TODO: consider moving this stitching into the scanner context. The scanner
+    // context usually handles the stitching but no other scanner need this logic
+    // now.
+    metadata_buffer.resize(metadata_size);
+    metadata_ptr = &metadata_buffer[0];
+    int copy_offset = 0;
+    DiskIoMgr* io_mgr = scan_node_->runtime_state()->io_mgr();
+
+    while (metadata_bytes_to_read > 0) {
+      int to_read = ::min(io_mgr->max_read_buffer_size(), metadata_bytes_to_read);
+      DiskIoMgr::ScanRange* range = scan_node_->AllocateScanRange(
+          metadata_range_->file(), to_read, metadata_start + copy_offset, -1,
+          metadata_range_->disk_id(), metadata_range_->try_cache());
+
+      DiskIoMgr::BufferDescriptor* io_buffer = NULL;
+      RETURN_IF_ERROR(io_mgr->Read(scan_node_->reader_context(), range, &io_buffer));
+      memcpy(metadata_ptr + copy_offset, io_buffer->buffer(), io_buffer->len());
+      io_buffer->Return();
+
+      metadata_bytes_to_read -= to_read;
+      copy_offset += to_read;
+    }
+    DCHECK_EQ(metadata_bytes_to_read, 0);
+  }
+  // Deserialize file header
+  Status status =
+      DeserializeThriftMsg(metadata_ptr, &metadata_size, true, &file_metadata_);
+  if (!status.ok()) {
+    stringstream ss;
+    ss << "File " << stream_->filename() << " has invalid file metadata at file offset "
+        << (metadata_size + sizeof(PARQUET_VERSION_NUMBER) + sizeof(uint32_t)) << ". "
+        << "Error = " << status.GetErrorMsg();
+    return Status(ss.str());
+  }
+
+  RETURN_IF_ERROR(ValidateFileMetadata());
+
+  // Tell the scan node this file has been taken care of.
+  HdfsFileDesc* desc = scan_node_->GetFileDesc(stream_->filename());
+  scan_node_->MarkFileDescIssued(desc);
+
+  if (scan_node_->materialized_slots().empty()) {
+    // No materialized columns.  We can serve this query from just the metadata.  We
+    // don't need to read the column data.
+    int64_t num_tuples = file_metadata_.num_rows;
+    COUNTER_UPDATE(scan_node_->rows_read_counter(), num_tuples);
+
+    while (num_tuples > 0) {
+      MemPool* pool;
+      Tuple* tuple;
+      TupleRow* current_row;
+      int max_tuples = GetMemory(&pool, &tuple, &current_row);
+      max_tuples = min(static_cast<int64_t>(max_tuples), num_tuples);
+      num_tuples -= max_tuples;
+
+      int num_to_commit = WriteEmptyTuples(context_, current_row, max_tuples);
+      RETURN_IF_ERROR(CommitRows(num_to_commit));
+    }
+
+    *eosr = true;
+    return Status::OK;
+  } else if (file_metadata_.num_rows == 0) {
+    // Empty file
+    *eosr = true;
+    return Status::OK;
+  }
+
+  if (file_metadata_.row_groups.empty()) {
+    stringstream ss;
+    ss << "Invalid file. This file: " << stream_->filename() << " has no row groups";
+    return Status(ss.str());
+  }
+
   return Status::OK;
 }
 
@@ -856,7 +901,7 @@ Status HdfsParquetScanner::InitColumns(int row_group_idx) {
 
     DiskIoMgr::ScanRange* col_range = scan_node_->AllocateScanRange(
         metadata_range_->file(), col_len, col_start, file_col_idx,
-        metadata_range_->disk_id());
+        metadata_range_->disk_id(), metadata_range_->try_cache());
     col_ranges.push_back(col_range);
 
     // Get the stream that will be used for this column
@@ -866,12 +911,12 @@ Status HdfsParquetScanner::InitColumns(int row_group_idx) {
     RETURN_IF_ERROR(column_readers_[i]->Reset(&schema_element,
         &col_chunk.meta_data, stream));
 
-    if (scan_node_->materialized_slots()[i]->type() != TYPE_STRING ||
+    if (scan_node_->materialized_slots()[i]->type().type != TYPE_STRING ||
         col_chunk.meta_data.codec != parquet::CompressionCodec::UNCOMPRESSED) {
       // Non-string types are always compact.  Compressed columns don't reference data
       // in the io buffers after tuple materialization.  In both cases, we can set compact
       // to true and recycle buffers more promptly.
-      stream->set_compact_data(true);
+      stream->set_contains_tuple_data(false);
     }
   }
   DCHECK_EQ(col_ranges.size(), column_readers_.size());
@@ -991,7 +1036,7 @@ Status HdfsParquetScanner::ValidateColumn(const SlotDescriptor* slot_desc, int c
   }
 
   // Check the type in the file is compatible with the catalog metadata.
-  parquet::Type::type type = IMPALA_TO_PARQUET_TYPES[slot_desc->type()];
+  parquet::Type::type type = IMPALA_TO_PARQUET_TYPES[slot_desc->type().type];
   if (type != file_data.meta_data.type) {
     stringstream ss;
     ss << "File " << stream_->filename() << " has an incompatible type with the"

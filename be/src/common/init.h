@@ -18,9 +18,10 @@
 namespace impala {
 
 // Initialises logging, flags, and, if init_jvm is true, an embedded JVM.
+// is_fe_tests is set to true when called from the FE during tests when there is no BE.
 // Callers that want to override default gflags variables should do so before calling
 // this method. No logging should be performed until after this method returns.
-void InitCommonRuntime(int argc, char** argv, bool init_jvm);
+void InitCommonRuntime(int argc, char** argv, bool init_jvm, bool is_fe_tests = false);
 
 }
 

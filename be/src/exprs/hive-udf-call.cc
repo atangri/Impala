@@ -59,11 +59,11 @@ struct HiveUdfCall::JniContext {
 };
 
 HiveUdfCall::HiveUdfCall(const TExprNode& node)
-  : Expr(node), udf_(node.fn_call_expr.fn),
+  : Expr(node),
     jni_context_(new JniContext) {
-  DCHECK(node.__isset.fn_call_expr);
+  is_udf_call_ = true;
   DCHECK_EQ(node.node_type, TExprNodeType::FUNCTION_CALL);
-  DCHECK_EQ(node.fn_call_expr.fn.binary_type, TFunctionBinaryType::HIVE);
+  DCHECK_EQ(node.fn.binary_type, TFunctionBinaryType::HIVE);
 }
 
 HiveUdfCall::~HiveUdfCall() {
@@ -100,7 +100,7 @@ void* HiveUdfCall::Evaluate(Expr* e, TupleRow* row) {
     } else {
       uint8_t* input_ptr = ctx->input_values_buffer_ + udf->input_byte_offsets_[i];
       ctx->input_nulls_buffer_[i] = 0;
-      switch (e->GetChild(i)->type()) {
+      switch (e->GetChild(i)->type().type) {
         case TYPE_BOOLEAN:
         case TYPE_TINYINT:
           // Using explicit sizes helps the compiler unroll memcpy
@@ -133,8 +133,8 @@ void* HiveUdfCall::Evaluate(Expr* e, TupleRow* row) {
   Status status = JniUtil::GetJniExceptionMsg(env);
   if (!status.ok()) {
     stringstream ss;
-    ss << "Hive UDF path=" << udf->udf_.hdfs_location << " class="
-       << udf->udf_.scalar_fn.symbol
+    ss << "Hive UDF path=" << udf->fn_.hdfs_location << " class="
+       << udf->fn_.scalar_fn.symbol
        << " failed due to: " << status.GetErrorMsg();
     udf->state_->LogError(ss.str());
     return NULL;
@@ -149,8 +149,8 @@ Status HiveUdfCall::Prepare(RuntimeState* state, const RowDescriptor& row_desc) 
 
   // Copy the Hive Jar from hdfs to local file system.
   string local_path;
-  RETURN_IF_ERROR(state->lib_cache()->GetLocalLibPath(
-        state->fs_cache(), udf_.hdfs_location, LibCache::TYPE_JAR, &local_path));
+  RETURN_IF_ERROR(LibCache::instance()->GetLocalLibPath(
+      fn_.hdfs_location, LibCache::TYPE_JAR, &local_path));
 
   JNIEnv* env = getJNIEnv();
   if (env == NULL) return Status("Failed to get/create JVM");
@@ -169,19 +169,19 @@ Status HiveUdfCall::Prepare(RuntimeState* state, const RowDescriptor& row_desc) 
   int input_buffer_size = 0;
 
   THiveUdfExecutorCtorParams ctor_params;
-  ctor_params.fn = udf_;
+  ctor_params.fn = fn_;
   ctor_params.local_location = local_path;
   for (int i = 0; i < GetNumChildren(); ++i) {
     ctor_params.input_byte_offsets.push_back(input_buffer_size);
     input_byte_offsets_.push_back(input_buffer_size);
-    input_buffer_size += GetSlotSize(GetChild(i)->type());
+    input_buffer_size += GetChild(i)->type().GetSlotSize();
     // Align all values up to 8 bytes. We don't care about footprint since we allocate
     // one buffer for all rows and we never copy the entire buffer.
     input_buffer_size = BitUtil::RoundUp(input_buffer_size, 8);
   }
   jni_context_->input_values_buffer_ = new uint8_t[input_buffer_size];
   jni_context_->input_nulls_buffer_ = new uint8_t[GetNumChildren()];
-  jni_context_->output_value_buffer_ = new uint8_t[GetSlotSize(type())];
+  jni_context_->output_value_buffer_ = new uint8_t[type().GetSlotSize()];
 
   ctor_params.input_buffer_ptr = (int64_t)jni_context_->input_values_buffer_;
   ctor_params.input_nulls_ptr = (int64_t)jni_context_->input_nulls_buffer_;
@@ -208,8 +208,8 @@ Status HiveUdfCall::Prepare(RuntimeState* state, const RowDescriptor& row_desc) 
 
 string HiveUdfCall::DebugString() const {
   stringstream out;
-  out << "HiveUdfCall(hdfs_location=" << udf_.hdfs_location
-      << " classname=" << udf_.scalar_fn.symbol << " "
+  out << "HiveUdfCall(hdfs_location=" << fn_.hdfs_location
+      << " classname=" << fn_.scalar_fn.symbol << " "
       << Expr::DebugString() << ")";
   return out.str();
 }

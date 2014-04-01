@@ -18,36 +18,45 @@ import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
 import com.cloudera.impala.catalog.AuthorizationException;
-import com.cloudera.impala.catalog.PrimitiveType;
+import com.cloudera.impala.catalog.ColumnType;
+import com.cloudera.impala.catalog.Db;
+import com.cloudera.impala.catalog.Function.CompareMode;
+import com.cloudera.impala.catalog.ScalarFunction;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.thrift.TExprNode;
 import com.cloudera.impala.thrift.TExprNodeType;
-import com.cloudera.impala.thrift.TExprOpcode;
 import com.cloudera.impala.thrift.TLikePredicate;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 
 public class LikePredicate extends Predicate {
   enum Operator {
-    LIKE("LIKE", TExprOpcode.LIKE),
-    RLIKE("RLIKE", TExprOpcode.REGEX),
-    REGEXP("REGEXP", TExprOpcode.REGEX);
+    LIKE("LIKE"),
+    RLIKE("RLIKE"),
+    REGEXP("REGEXP");
 
     private final String description_;
-    private final TExprOpcode thriftOp_;
 
-    private Operator(String description, TExprOpcode thriftOp) {
+    private Operator(String description) {
       this.description_ = description;
-      this.thriftOp_ = thriftOp;
     }
 
     @Override
     public String toString() {
       return description_;
     }
+  }
 
-    public TExprOpcode toThrift() {
-      return thriftOp_;
-    }
+  public static void initBuiltins(Db db) {
+    db.addBuiltin(ScalarFunction.createBuiltinOperator(
+        Operator.LIKE.name(), "LikePredicate", "LikeFn",
+        Lists.newArrayList(ColumnType.STRING, ColumnType.STRING), ColumnType.BOOLEAN));
+    db.addBuiltin(ScalarFunction.createBuiltinOperator(
+        Operator.RLIKE.name(), "LikePredicate", "RegexFn",
+        Lists.newArrayList(ColumnType.STRING, ColumnType.STRING), ColumnType.BOOLEAN));
+    db.addBuiltin(ScalarFunction.createBuiltinOperator(
+        Operator.REGEXP.name(), "LikePredicate", "RegexFn",
+        Lists.newArrayList(ColumnType.STRING, ColumnType.STRING), ColumnType.BOOLEAN));
   }
 
   private final Operator op_;
@@ -79,7 +88,6 @@ public class LikePredicate extends Predicate {
   @Override
   protected void toThrift(TExprNode msg) {
     msg.node_type = TExprNodeType.LIKE_PRED;
-    msg.setOpcode(op_.toThrift());
     msg.like_pred = new TLikePredicate("\\");
   }
 
@@ -88,16 +96,19 @@ public class LikePredicate extends Predicate {
       AuthorizationException {
     if (isAnalyzed_) return;
     super.analyze(analyzer);
-    if (getChild(0).getType() != PrimitiveType.STRING
-        && !getChild(0).getType().isNull()) {
+    if (!getChild(0).getType().isStringType() && !getChild(0).getType().isNull()) {
       throw new AnalysisException(
           "left operand of " + op_.toString() + " must be of type STRING: " + toSql());
     }
-    if (getChild(1).getType() != PrimitiveType.STRING
-        && !getChild(1).getType().isNull()) {
+    if (!getChild(1).getType().isStringType() && !getChild(1).getType().isNull()) {
       throw new AnalysisException(
           "right operand of " + op_.toString() + " must be of type STRING: " + toSql());
     }
+
+    fn_ = getBuiltinFunction(analyzer, op_.toString(), collectChildReturnTypes(),
+        CompareMode.IS_SUPERTYPE_OF);
+    Preconditions.checkState(fn_ != null);
+    Preconditions.checkState(fn_.getReturnType().isBoolean());
 
     if (!getChild(1).getType().isNull() && getChild(1).isLiteral()
         && (op_ == Operator.RLIKE || op_ == Operator.REGEXP)) {

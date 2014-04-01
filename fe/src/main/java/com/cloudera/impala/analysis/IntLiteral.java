@@ -17,7 +17,7 @@ package com.cloudera.impala.analysis;
 import java.math.BigInteger;
 
 import com.cloudera.impala.catalog.AuthorizationException;
-import com.cloudera.impala.catalog.PrimitiveType;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.NotImplementedException;
 import com.cloudera.impala.thrift.TExprNode;
@@ -34,6 +34,7 @@ public class IntLiteral extends LiteralExpr {
 
   public IntLiteral(BigInteger value) {
     this.value_ = value;
+    isAnalyzed_ = false;
   }
 
   public IntLiteral(String value) throws AnalysisException,
@@ -45,30 +46,33 @@ public class IntLiteral extends LiteralExpr {
       throw new AnalysisException("invalid integer literal: " + value, e);
     }
     this.value_ = BigInteger.valueOf(longValue.longValue());
+    isAnalyzed_ = false;
     analyze(null);
   }
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException,
       AuthorizationException {
+    if (isAnalyzed_) return;
     super.analyze(analyzer);
     if (value_.compareTo(BigInteger.valueOf(Byte.MAX_VALUE)) <= 0 &&
         value_.compareTo(BigInteger.valueOf(Byte.MIN_VALUE)) >= 0) {
-      type_ = PrimitiveType.TINYINT;
+      type_ = ColumnType.TINYINT;
     } else if (value_.compareTo(BigInteger.valueOf(Short.MAX_VALUE)) <= 0 &&
         value_.compareTo(BigInteger.valueOf(Short.MIN_VALUE)) >= 0) {
-      type_ = PrimitiveType.SMALLINT;
+      type_ = ColumnType.SMALLINT;
     } else if (value_.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) <= 0 &&
         value_.compareTo(BigInteger.valueOf(Integer.MIN_VALUE)) >= 0) {
-      type_ = PrimitiveType.INT;
+      type_ = ColumnType.INT;
     } else {
       if (value_.compareTo(BigInteger.valueOf(Long.MAX_VALUE)) > 0 ||
           value_.compareTo(BigInteger.valueOf(Long.MIN_VALUE)) < 0) {
         throw new AnalysisException(
             String.format("Literal '%s' exceeds maximum range of integers.", toSql()));
       }
-      type_ = PrimitiveType.BIGINT;
+      type_ = ColumnType.BIGINT;
     }
+    isAnalyzed_ = true;
   }
 
   public long getValue() { return value_.longValue(); }
@@ -105,14 +109,17 @@ public class IntLiteral extends LiteralExpr {
   }
 
   @Override
-  protected Expr uncheckedCastTo(PrimitiveType targetType) throws AnalysisException {
+  protected Expr uncheckedCastTo(ColumnType targetType) throws AnalysisException {
     Preconditions.checkState(targetType.isNumericType());
-    if (targetType.isFixedPointType()) {
+    if (targetType.isIntegerType()) {
       this.type_ = targetType;
       return this;
     } else if (targetType.isFloatingPointType()) {
       return new FloatLiteral(new Double(value_.longValue()), targetType);
+    } else if (targetType.isDecimal()) {
+      return new CastExpr(targetType, this, true);
     }
+    Preconditions.checkState(false, "Unhandled case");
     return this;
   }
 

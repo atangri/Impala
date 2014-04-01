@@ -45,7 +45,7 @@ class SorterTest : public testing::Test {
   static const int BATCH_CAPACITY = 100;  // rows
 
   SorterTest() : writer_(),
-      runtime_state_(TUniqueId(), TUniqueId(), TQueryContext(), NULL) {
+      runtime_state_(TUniqueId(), TUniqueId(), TQueryContext(), "", NULL) {
     resource_pool_.reset(resource_mgr_.RegisterPool());
     Reset();
   }
@@ -798,7 +798,7 @@ class BatchSupplier : public RowBatchSupplier {
       RowBatch* batch = batches_[index_];
 
       for (int i = 0; i < batch->num_rows(); ++i) {
-        DCHECK(!row_batch->IsFull()) << "Merge batch is too small for test";
+        DCHECK(!row_batch->AtCapacity()) << "Merge batch is too small for test";
         Tuple* tuple = batch->GetRow(i)->GetTuple(0);
         int row_idx = row_batch->AddRow();
         row_batch->GetRow(row_idx)->SetTuple(0, tuple);

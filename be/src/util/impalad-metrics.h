@@ -74,6 +74,15 @@ class ImpaladMetricKeys {
   // Number of IO buffers that are currently unused (and can be GC'ed)
   static const char* IO_MGR_NUM_UNUSED_BUFFERS;
 
+  // Total number of bytes read by the io mgr
+  static const char* IO_MGR_BYTES_READ;
+
+  // Total number of local bytes read by the io mgr
+  static const char* IO_MGR_LOCAL_BYTES_READ;
+
+  // Total number of short-circuit bytes read by the io mgr
+  static const char* IO_MGR_SHORT_CIRCUIT_BYTES_READ;
+
   // Number of DBs in the catalog
   static const char* CATALOG_NUM_DBS;
 
@@ -94,6 +103,12 @@ class ImpaladMetricKeys {
 
   // Number of queries expired due to inactivity
   static const char* NUM_QUERIES_EXPIRED;
+
+  // Total number of rows cached to support HS2 FETCH_FIRST.
+  static const char* RESULTSET_CACHE_TOTAL_NUM_ROWS;
+
+  // Total bytes consumed for rows cached to support HS2 FETCH_FIRST.
+  static const char* RESULTSET_CACHE_TOTAL_BYTES;
 };
 
 // Global impalad-wide metrics.  This is useful for objects that want to update metrics
@@ -118,12 +133,17 @@ class ImpaladMetrics {
   static Metrics::IntMetric* IO_MGR_NUM_BUFFERS;
   static Metrics::IntMetric* IO_MGR_TOTAL_BYTES;
   static Metrics::IntMetric* IO_MGR_NUM_UNUSED_BUFFERS;
+  static Metrics::BytesMetric* IO_MGR_BYTES_READ;
+  static Metrics::BytesMetric* IO_MGR_LOCAL_BYTES_READ;
+  static Metrics::BytesMetric* IO_MGR_SHORT_CIRCUIT_BYTES_READ;
   static Metrics::IntMetric* CATALOG_NUM_DBS;
   static Metrics::IntMetric* CATALOG_NUM_TABLES;
   static Metrics::BooleanMetric* CATALOG_READY;
   static Metrics::IntMetric* NUM_FILES_OPEN_FOR_INSERT;
   static Metrics::IntMetric* NUM_SESSIONS_EXPIRED;
   static Metrics::IntMetric* NUM_QUERIES_EXPIRED;
+  static Metrics::IntMetric* RESULTSET_CACHE_TOTAL_NUM_ROWS;
+  static Metrics::BytesMetric* RESULTSET_CACHE_TOTAL_BYTES;
 
   // Creates and initializes all metrics above in 'm'.
   static void CreateMetrics(Metrics* m);
